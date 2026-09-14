@@ -472,12 +472,14 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             turn_id,
             created_at,
             route,
+            submission_id,
         } => wire::EventMsg::TurnStarted {
             thread_id,
             session_id,
             turn_id: turn_id.clone(),
             created_at: *created_at,
             route: route.as_ref().map(route_to_wire),
+            submission_id: submission_id.clone(),
         },
         Event::ToolRequestSnapshot { snapshot } => wire::EventMsg::ToolRequestSnapshot {
             thread_id,
@@ -929,6 +931,9 @@ pub fn op_to_protocol(op: &Op) -> wire_op::Op {
             verbosity,
             provenance,
             turn_tool_security: _,
+            // The protocol op has no correlation twin; the token is
+            // host-process-local by design.
+            submission_id: _,
         } => wire_op::Op::SendMessage {
             content: content.clone(),
             mode: app_mode_str(*mode).to_string(),
@@ -1123,7 +1128,10 @@ pub fn op_to_protocol(op: &Op) -> wire_op::Op {
             config_path: config_path.clone(),
         },
         Op::PurgeContext => wire_op::Op::PurgeContext,
-        Op::EditLastTurn { new_message } => wire_op::Op::EditLastTurn {
+        Op::EditLastTurn {
+            new_message,
+            submission_id: _,
+        } => wire_op::Op::EditLastTurn {
             new_message: new_message.clone(),
         },
         Op::SetAdvisorEnabled { enabled } => wire_op::Op::SetAdvisorEnabled { enabled: *enabled },
@@ -1236,6 +1244,7 @@ mod tests {
                 turn_id: "turn-1".into(),
                 created_at: chrono::Utc::now(),
                 route: None,
+                submission_id: None,
             },
             Event::TurnComplete {
                 usage: usage.clone(),
@@ -1372,6 +1381,7 @@ mod tests {
             Op::PurgeContext,
             Op::EditLastTurn {
                 new_message: "again".into(),
+                submission_id: None,
             },
             Op::SetAdvisorEnabled { enabled: true },
             Op::Shutdown,
