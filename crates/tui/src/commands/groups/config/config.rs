@@ -4372,7 +4372,7 @@ heartbeat_timeout_secs = 1
             )
         );
         assert!(msg.contains(
-            "subagents.heartbeat_timeout_secs = 1 (resolved global 630; active provider 630)"
+            "subagents.heartbeat_timeout_secs = 1 (resolved global 1830; active provider 1830)"
         ));
         assert!(msg.contains("subagents.providers.deepseek = inherits global"));
     }

@@ -3007,6 +3007,10 @@ fn subagent_heartbeat_timeout_defaults_clamps_and_respects_api_timeout() {
         DEFAULT_SUBAGENT_TOOL_TIMEOUT_SECS + 30
     );
 
+    // api_timeout (900) + 30 = 930 no longer binds once the tool floor
+    // (default 1800 + 30 = 1830) is higher, so the resolved value follows the
+    // tool floor here; use an api timeout above the tool floor to exercise
+    // the api-bound branch of the floor.
     let follows_long_api_timeout = Config {
         subagents: Some(SubagentsConfig {
             api_timeout_secs: Some(900),
@@ -3017,7 +3021,20 @@ fn subagent_heartbeat_timeout_defaults_clamps_and_respects_api_timeout() {
     };
     assert_eq!(
         follows_long_api_timeout.subagent_heartbeat_timeout_secs(),
-        930
+        DEFAULT_SUBAGENT_TOOL_TIMEOUT_SECS + 30
+    );
+
+    let api_dominates_tool_floor = Config {
+        subagents: Some(SubagentsConfig {
+            api_timeout_secs: Some(2000),
+            heartbeat_timeout_secs: Some(300),
+            ..SubagentsConfig::default()
+        }),
+        ..Config::default()
+    };
+    assert_eq!(
+        api_dominates_tool_floor.subagent_heartbeat_timeout_secs(),
+        2030
     );
 
     let high = Config {
