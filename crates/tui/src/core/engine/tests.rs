@@ -20136,9 +20136,10 @@ async fn code_execution_scenario() {
 #[cfg(unix)]
 #[tokio::test]
 async fn code_execution_timeout_kills_the_interpreter_instead_of_orphaning_it() {
+    use std::io::Write;
     // The kill path needs a real interpreter; skip where python is absent.
     if crate::dependencies::resolve_python_interpreter().is_none() {
-        eprintln!("skipping: python not present");
+        let _ = writeln!(std::io::stderr(), "skipping: python not present");
         return;
     }
     let tmp = tempdir().expect("tempdir");
@@ -25053,7 +25054,7 @@ async fn forkguard_reload_injects_recovery_notice_exactly_once() {
         let briefed = snapshot
             .messages
             .iter()
-            .any(|message| crate::runtime_handoff::is_mcp_boot_failure_briefing_message(message));
+            .any(crate::runtime_handoff::is_mcp_boot_failure_briefing_message);
         if briefed {
             break;
         }
