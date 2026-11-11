@@ -63,120 +63,29 @@ use crate::models::Tool;
 /// - Collapse single-element `oneOf` / `allOf`
 /// - Walk recursively through all subschemas
 pub fn sanitize(schema: &mut Value) {
-    sanitize_in_instance(schema, &[]);
+    sanitize_inner(schema, false);
 }
 
-/// Sanitize a schema for one JSON instance scope.
-///
-/// `enclosing_properties` carries the property names declared by the
-/// enclosing object schema for the *same* instance: a `required` array
-/// inside a composition branch refers to that instance, so a required-only
-/// branch such as `oneOf: [{required: ["patch"]}, ...]` (the builtin
-/// `apply_patch` shape) keeps its entries — they resolve against the root
-/// `properties` — instead of being pruned into `{}`, which under `oneOf`
-/// semantics would reject every instance (all-empty branches match
-/// everything, so exactly-one-match is unsatisfiable). Every other keyword
-/// (`properties.*`, `items`, `additionalProperties`, ...) validates a
-/// different instance, so the context resets there and only genuinely
-/// dangling names are pruned.
-fn sanitize_in_instance(schema: &mut Value, enclosing_properties: &[String]) {
-    // Whether THIS schema declared a properties map before the injection
-    // pass: capture AFTER the nullable-union collapse (a merged arm's map —
-    // even an explicitly empty one — is the schema's own declaration,
-    // review thread on 5897819279) but BEFORE
-    // `inject_properties_on_bare_objects`, whose synthetic map is not a
-    // declaration (review threads on 5896057559 and 5897491074: treating
-    // it as one discarded the inherited context for composition
-    // intermediates).
-    collapse_nullable_unions(schema);
-    let declared_properties = schema
-        .as_object()
-        .is_some_and(|obj| obj.contains_key("properties"));
-    inject_properties_on_bare_objects(schema);
-    prune_dangling_required(schema, enclosing_properties, declared_properties);
-    collapse_single_element_unions(schema);
+/// The shared transforms plus recursion. `inside_literal` marks subtrees that
+/// are VALUES (enum members, `const`, `default`, `examples`) rather than
+/// schemas: the transforms rewrite schema shapes, and applying them to a
+/// literal value corrupts it — an enum member `{"type":"object"}` is a value
+/// that happens to look like a schema, and injecting `properties:{}` into it
+/// changes the set of values the model may send while `required` pruning
+/// deletes keys of object-shaped defaults.
+fn sanitize_inner(schema: &mut Value, inside_literal: bool) {
+    if !inside_literal {
+        collapse_nullable_unions(schema);
+        inject_properties_on_bare_objects(schema);
+        prune_dangling_required(schema);
+        collapse_single_element_unions(schema);
+    }
     // Recurse into all sub-schemas
     if let Some(obj) = schema.as_object_mut() {
-        // The context this scope hands its same-instance applicators: a
-        // DECLARED `properties` map replaces the inherited names, while an
-        // object with no declaration of its own introduces no property
-        // scope and passes the inherited names through — a nested
-        // composition inside an untyped or bare-typed `{oneOf: [...]}`
-        // branch still resolves against the ancestor that declared the
-        // properties (review threads on 5896057559 and 5897491074: the
-        // injected compatibility map must not read as a declaration, or
-        // the inner required-only branches prune into `{}` and no valid
-        // argument survives).
-        let local_properties: Vec<String> = match obj.get("properties") {
-            Some(props) if declared_properties => props
-                .as_object()
-                .map(|props| props.keys().cloned().collect())
-                .unwrap_or_default(),
-            Some(props) if props.as_object().is_some_and(|m| !m.is_empty()) => {
-                // A collapse merged a union arm's real property map into
-                // this scope: that map is the schema's own declaration.
-                props
-                    .as_object()
-                    .map(|props| props.keys().cloned().collect())
-                    .unwrap_or_default()
-            }
-            _ => enclosing_properties.to_vec(),
-        };
         for (key, v) in obj.iter_mut() {
-            if matches!(
-                key.as_str(),
-                "oneOf" | "anyOf" | "allOf" | "not" | "if" | "then" | "else"
-            ) {
-                sanitize_in_instance(v, &local_properties);
-            } else if key == "dependentSchemas" {
-                // Draft 2020-12: each dependentSchemas value applies to the
-                // SAME instance as the object schema holding it, so a
-                // dependency naming only fields declared at this scope
-                // (`{required: ["confirm"]}` against the enclosing
-                // properties) must resolve here instead of pruning into an
-                // all-accepting `{}` — the compatible-Messages lane would
-                // otherwise forward a contract that admits a `mode`-only
-                // argument with no `confirm` at all (review 5910284697).
-                // The name keys route instances; they are not schema
-                // scopes, so the reset applies inside the map's values only.
-                if let Some(dep_map) = v.as_object_mut() {
-                    for (_name, dep) in dep_map.iter_mut() {
-                        sanitize_in_instance(dep, &local_properties);
-                    }
-                }
-            } else if key == "enum" || key == "const" {
-                // Instance data, not schema: each enum entry and the const
-                // value is a literal JSON value the tool can receive, so a
-                // schema-shaped entry (`enum: [{"required": ["x"]}]` for a
-                // property named `required`) must reach the wire
-                // byte-for-byte. The generic recursion used to normalize
-                // those literal objects — pruning their `required` into an
-                // all-accepting `{}` — excluding an argument the original
-                // contract admitted and advertising a different one (review
-                // 5911391551).
-            } else if matches!(
-                key.as_str(),
-                "properties" | "patternProperties" | "$defs" | "definitions"
-            ) {
-                // A name→schema map: the keys route names and are never
-                // keywords. The generic walk dispatched a property
-                // literally named `dependentSchemas` as the keyword, treated
-                // its schema as a dependency map, walked the enum literal
-                // inside as schemas, and pruned the literal object's
-                // `required` into an all-accepting `{}` — reversing what
-                // the contract accepts (review 5986025535). Walk each VALUE
-                // as a schema node in its own right; the empty context
-                // matches the previous treatment of property subtrees.
-                if let Some(name_map) = v.as_object_mut() {
-                    for (_name, prop_schema) in name_map.iter_mut() {
-                        sanitize_in_instance(prop_schema, &[]);
-                    }
-                } else {
-                    sanitize_in_instance(v, &[]);
-                }
-            } else {
-                sanitize_in_instance(v, &[]);
-            }
+            let child_literal =
+                inside_literal || matches!(key.as_str(), "enum" | "const" | "default" | "examples");
+            sanitize_inner(v, child_literal);
         }
     } else if let Some(arr) = schema.as_array_mut() {
         // Composition branch lists arrive as the array value of a
@@ -185,7 +94,7 @@ fn sanitize_in_instance(schema: &mut Value, enclosing_properties: &[String]) {
         // properties. Non-composition arrays enter with an empty context
         // and keep it.
         for v in arr.iter_mut() {
-            sanitize_in_instance(v, enclosing_properties);
+            sanitize_inner(v, inside_literal);
         }
     }
 }
