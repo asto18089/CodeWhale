@@ -4462,6 +4462,13 @@ fn doctor_api_key_providers() -> impl Iterator<Item = crate::config::ApiProvider
 /// OAuth connectivity is exercised by an ordinary user request instead;
 /// doctor limits itself to non-mutating readiness inspection.
 fn doctor_should_probe_auth(config: &Config) -> bool {
+    // The auth facts the served route speaks: scoped to the launch
+    // identity like the credential source line (round 24 — the raw root's
+    // table gated a probe decision the session may not serve).
+    let identity = doctor_launch_identity(config);
+    let mut scoped = config.clone();
+    scoped.scope_to_provider_identity(&identity);
+    let config = &scoped;
     let provider = config.api_provider();
     if provider == crate::config::ApiProvider::OpenaiCodex
         && !config.provider_uses_custom_endpoint(provider)
@@ -4809,13 +4816,9 @@ async fn run_doctor(
                     "✗".truecolor(red_r, red_g, red_b)
                 );
                 if error_msg.contains("401") || error_msg.contains("Unauthorized") {
-                    println!(
-                        "    Invalid API key. Check `codewhale auth status`, DEEPSEEK_API_KEY, or config.toml"
-                    );
+                    println!("    {}", invalid_api_key_hint(human_provider));
                 } else if error_msg.contains("403") || error_msg.contains("Forbidden") {
-                    println!(
-                        "    API key lacks permissions. Verify key is active at platform.deepseek.com"
-                    );
+                    println!("    {}", forbidden_api_key_hint(human_provider));
                 } else if error_msg.contains("timeout") || error_msg.contains("Timeout") {
                     for line in doctor_timeout_recovery_lines(config) {
                         println!("    {line}");
@@ -4824,7 +4827,7 @@ async fn run_doctor(
                     println!("    DNS resolution failed. Check your network connection");
                 } else if error_msg.contains("connect") {
                     println!("    Connection failed. Check firewall settings or try again");
-                } else if crate::doctor::is_keyless_ds4_route(config) {
+                } else if crate::doctor::is_keyless_ds4_route(&human_scoped) {
                     println!("    {error_msg}");
                 } else {
                     println!(
@@ -7519,6 +7522,38 @@ fn doctor_auth_scheme(config: &Config) -> &'static str {
     }
 }
 
+/// The 401 recovery hint for the SERVED provider: the DeepSeek-era
+/// wording named `DEEPSEEK_API_KEY` and this crate's console for every
+/// provider's 401 (round 24 — non-DeepSeek routes get a provider-neutral
+/// hint; the family keeps its specific one).
+fn invalid_api_key_hint(provider: crate::config::ApiProvider) -> &'static str {
+    if matches!(
+        provider,
+        crate::config::ApiProvider::Deepseek
+            | crate::config::ApiProvider::DeepseekCN
+            | crate::config::ApiProvider::DeepseekAnthropic
+    ) {
+        "Invalid API key. Check `codewhale auth status`, DEEPSEEK_API_KEY, or config.toml"
+    } else {
+        "Invalid or missing API key for this provider. Check `codewhale auth status` or config.toml"
+    }
+}
+
+/// The 403 recovery hint for the SERVED provider; see
+/// [`invalid_api_key_hint`].
+fn forbidden_api_key_hint(provider: crate::config::ApiProvider) -> &'static str {
+    if matches!(
+        provider,
+        crate::config::ApiProvider::Deepseek
+            | crate::config::ApiProvider::DeepseekCN
+            | crate::config::ApiProvider::DeepseekAnthropic
+    ) {
+        "API key lacks permissions. Verify key is active at platform.deepseek.com"
+    } else {
+        "API key lacks permissions for this provider. Verify the key's scopes or plan with the provider"
+    }
+}
+
 fn doctor_xiaomi_mimo_base_url_uses_token_plan(base_url: &str) -> bool {
     let normalized = base_url.trim_end_matches('/');
     [
@@ -8115,6 +8150,13 @@ fn recommended_strict_base_url(_config: &Config, _base_url: &str) -> &'static st
 }
 
 fn doctor_timeout_recovery_lines(config: &Config) -> Vec<String> {
+    // Round 24: provider facts in the recovery lines answer from the
+    // launch identity (the raw root's typing attributed its endpoint
+    // advice to a served route that may differ).
+    let identity = doctor_launch_identity(config);
+    let mut scoped = config.clone();
+    scoped.scope_to_provider_identity(&identity);
+    let config = &scoped;
     let target = doctor_api_target(config);
     let mut lines = vec![format!(
         "Connection timed out while reaching {}.",

@@ -2901,6 +2901,42 @@ fn has_strict_incompatible_composition(schema: &Value, root: &Value, is_root: bo
                     }
                 }
                 key if STRICT_LITERAL_KEYS.contains(&key) => {}
+                // A union is satisfiable through SOME branch: judging the
+                // branch array jointly instead of descending per branch
+                // keeps a dead branch beside a live one from failing the
+                // whole tool closed (the same single-compatible-member
+                // leniency the enum arms draw) — a property-position
+                // `{"anyOf":[{crossed bounds}, {type:"string"}]}` failed
+                // closed through the per-branch descent although the live
+                // branch witnesses satisfiability (round 24). The
+                // per-branch predicate is exactly the one the descent
+                // used, so shapeless/junk branches keep their old
+                // answers; only the ALL-to-ANY conjunction flips. Union
+                // nodes that carry sibling pins are judged against them
+                // by the composition arm before this walk runs.
+                "anyOf" => {
+                    if let Some(branches) = value.as_array()
+                        && !branches.is_empty()
+                    {
+                        // Null-family carriers are UNREPRESENTABLE, not
+                        // unsatisfiable: a null enum member / null const /
+                        // null type inside a branch means the strict
+                        // subset cannot express that branch's values at
+                        // all, so a witness from a sibling branch cannot
+                        // make the union faithfully shippable — the
+                        // round-3 contract keeps those fail-closed (the
+                        // null-enum-branch pin exercises exactly this:
+                        // `{enum: ["a", null]}` beside an integer branch).
+                        let poison = branches.iter().any(branch_carries_null_family);
+                        if poison
+                            || !branches.iter().any(|branch| {
+                                !has_strict_incompatible_composition(branch, root, false)
+                            })
+                        {
+                            return true;
+                        }
+                    }
+                }
                 // No ships-nowhere skip for `patternProperties`/
                 // `dependencies`/schema-form `additionalProperties` here:
                 // this gate judges the enforced clone, where the strip has
@@ -3158,8 +3194,11 @@ fn compiled_documented_pattern(obj: &Map<String, Value>) -> Option<regex::Regex>
         // Only a cacheable miss leaks its key: a source over the compile
         // cap can never compile, so caching it would grow the table — and
         // the leak — with no judging benefit, and a table at its bound
-        // inserts nothing rather than evicting a hot entry.
-        if pattern.len() <= 4_096 && cache.len() < 512 {
+        // inserts nothing rather than evicting a hot entry. The leak
+        // bound tracks the source cap: 512 keys x 16 KB ≈ 8 MB worst,
+        // one-time per process (round 24 raised the cap with the screen
+        // carrying the cost bound; the leak stays table-bounded).
+        if pattern.len() <= 16_384 && cache.len() < 512 {
             let key: &'static str = String::leak(pattern.to_string());
             #[cfg(test)]
             PATTERN_LEAKED_KEYS.with(|counter| counter.set(counter.get() + 1));
@@ -3176,7 +3215,16 @@ fn compile_documented_pattern(pattern: &str) -> Option<regex::Regex> {
     // bound the judge abstains compatible-by-default; the pattern still
     // ships and binds on the wire, the judge does not guess — the same
     // line the ECMA-only spellings draw.
-    if pattern.len() > 4_096 {
+    // Round 24: the source cap was the round-21 compile-cost bound, but
+    // compile cost is expansion-driven (the screen above now bounds it —
+    // a flat 16 KB literal alternation compiles in fractions of a
+    // millisecond while a 136-byte nested bounded repeat costs 11-15 ms),
+    // and capping the SOURCE kept every long-but-fine pattern on the
+    // abstention line: members beside such a pattern shipped strict
+    // unjudged (the round-23 review's oversize-pattern witness). 16 KB
+    // lets real validated patterns be judged; the expansion screen and
+    // the per-request compile budget remain the actual cost bounds.
+    if pattern.len() > 16_384 {
         return None;
     }
     // Regex-dialect drift the judge cannot paper over: a case-insensitive
@@ -3238,10 +3286,13 @@ fn compile_documented_pattern(pattern: &str) -> Option<regex::Regex> {
         }
         index += 1;
     }
-    regex::RegexBuilder::new(pattern)
-        .size_limit(STRICT_PATTERN_COMPILED_SIZE_LIMIT)
-        .build()
-        .ok()
+    // No `RegexBuilder::size_limit` here: probed on this toolchain, it
+    // bounds the NFA compile and REJECTED a 4,000-literal flat
+    // alternation (~4 KB source) while the hostile nested bounded repeat
+    // slipped through it — the wrong bound in the wrong place. The
+    // expansion screen above is the cost bound; the per-request compile
+    // budget bounds how many screened patterns a preparation pays.
+    regex::Regex::new(pattern).ok()
 }
 
 /// Upper-bound parser for one `{n}`/`{n,m}`/`{n,}` tail, saturating; used
@@ -3262,11 +3313,6 @@ fn parse_repeat_bound(bytes: &[u8], cursor: &mut usize) -> Option<u64> {
 /// Expansion-screen bound on the product of bounded-repeat upper bounds;
 /// see the compile body for the measurement behind it.
 const STRICT_PATTERN_EXPANSION_LIMIT: u64 = 10_000;
-
-/// Lazy-DFA cache size cap passed to the regex builder; the NFA the
-/// matcher simulates is bounded by the expansion screen above, not by
-/// this.
-const STRICT_PATTERN_COMPILED_SIZE_LIMIT: usize = 256 * 1024;
 
 /// Whether one pinned string value satisfies the node's documented string
 /// constraints: the `pattern` (the caller passes the shared compiled
@@ -3349,6 +3395,109 @@ fn value_satisfies_documented_format(value: &str, format: &str) -> bool {
                 })
         }
         _ => true,
+    }
+}
+
+/// Whether one anyOf branch carries a null-family marker anywhere in its
+/// own shape (a `nullable` keyword, a null type spelling, a null const or
+/// enum member, or the same inside a nested union, property map, or
+/// items): such a branch is unrepresentable under the strict subset, so
+/// it poisons the whole union regardless of sibling witnesses (round 24
+/// — the union satisfiability special case must not forgive it).
+fn branch_carries_null_family(branch: &Value) -> bool {
+    let Some(obj) = branch.as_object() else {
+        return false;
+    };
+    if obj.contains_key("nullable") {
+        return true;
+    }
+    match obj.get("type") {
+        Some(Value::String(spelling)) if spelling == "null" => return true,
+        Some(Value::Array(spellings)) if spellings.iter().any(|spelling| spelling == "null") => {
+            return true;
+        }
+        Some(Value::Array(_)) => {}
+        _ => {}
+    }
+    if obj.get("const").is_some_and(Value::is_null) {
+        return true;
+    }
+    if obj
+        .get("enum")
+        .and_then(Value::as_array)
+        .is_some_and(|members| members.iter().any(Value::is_null))
+    {
+        return true;
+    }
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if obj
+            .get(key)
+            .and_then(Value::as_array)
+            .is_some_and(|nested| nested.iter().any(branch_carries_null_family))
+        {
+            return true;
+        }
+    }
+    if obj
+        .get("items")
+        .and_then(Value::as_object)
+        .is_some_and(|items| branch_carries_null_family(&Value::Object(items.clone())))
+    {
+        return true;
+    }
+    for container in ["properties", "$defs", "definitions", "$def"] {
+        if obj
+            .get(container)
+            .and_then(Value::as_object)
+            .is_some_and(|named| named.values().any(branch_carries_null_family))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Canonical byte encoding of one pinned value, exact under the
+/// JSON-Schema number rule: integral values (either storage spelling)
+/// render as their exact i128, so `2` and `2.0` hash identically the way
+/// [`pinned_values_equal`] compares them; genuinely fractional numbers
+/// render as their f64 bits. Injective w.r.t. that equality, which is
+/// what makes the hash-set membership oracle below sound.
+fn pinned_canonical_bytes(value: &Value, out: &mut Vec<u8>) {
+    match value {
+        Value::Number(_) => match bounds_number(value) {
+            Some(exact) => {
+                out.push(b'i');
+                out.extend(exact.to_le_bytes());
+            }
+            None => {
+                out.push(b'f');
+                out.extend(value.as_f64().unwrap_or(0.0).to_bits().to_le_bytes());
+            }
+        },
+        Value::String(text) => {
+            out.push(b's');
+            out.extend(text.as_bytes());
+            out.push(0);
+        }
+        Value::Bool(flag) => out.push(if *flag { b'B' } else { b'b' }),
+        Value::Null => out.push(b'N'),
+        Value::Array(items) => {
+            out.push(b'[');
+            for item in items {
+                pinned_canonical_bytes(item, out);
+            }
+            out.push(b']');
+        }
+        Value::Object(map) => {
+            out.push(b'{');
+            for (key, item) in map {
+                out.extend(key.as_bytes());
+                out.push(0);
+                pinned_canonical_bytes(item, out);
+            }
+            out.push(b'}');
+        }
     }
 }
 
@@ -3611,7 +3760,7 @@ fn branch_properties_value_compatible(
 }
 
 /// Whether one side's `enum` value stays within the pair judge's
-/// membership-scan caps: at most [`ENUM_PAIR_MEMBER_CAP`] members AND at
+/// membership-scan cap: at most [`ENUM_PAIR_MEMBER_BYTES_CAP`] serialized
 /// most [`ENUM_PAIR_MEMBER_BYTES_CAP`] serialized bytes. The count cap
 /// alone made the worst case a function of member BYTES — 256 members of
 /// 60 KB strings each are 4 GB of `Value` equality per pair call within
@@ -3620,15 +3769,16 @@ fn branch_properties_value_compatible(
 /// (a keep decision, never an overclosure: abstention can only miss an
 /// unsatisfiability detection, never reject a satisfiable schema).
 fn enum_members_within_judge_cap(members: &[Value]) -> bool {
-    if members.len() > ENUM_PAIR_MEMBER_CAP {
-        return false;
-    }
-    // Incremental with early exit, exact to the serialized ARRAY size the
-    // whole-array `to_vec` measured (members + separators + brackets): a
-    // hostile 256 × 16 KB enum paid the full 4 MB serialization per call
-    // per request (measured 19.8 s per node on the property-pin scan,
-    // which re-runs this check per member), while the first oversized
-    // member already decides the verdict here.
+    // Round 24: the member-COUNT cap is gone — the count cap existed to
+    // bound the quadratic value-equality scan, which the hash-based
+    // membership oracle replaced (linear in total bytes), and every other
+    // per-member judgment is linear in the member's own bytes. The
+    // serialized-BYTE cap alone bounds the scan's work: incremental with
+    // early exit, exact to the serialized ARRAY size the whole-array
+    // `to_vec` measured (members + separators + brackets) — a hostile
+    // 256 × 16 KB enum still decides at its first oversized member
+    // instead of paying the full 4 MB serialization per call per request
+    // (measured 19.8 s per node before the byte cap).
     let separators = members.len().saturating_sub(1) + 2;
     let mut member_bytes = 0usize;
     for member in members {
@@ -3646,13 +3796,10 @@ fn enum_members_within_judge_cap(members: &[Value]) -> bool {
 }
 
 /// Serialized-size cap for one side's `enum` value in the pair judge's
-/// membership scan; see [`enum_members_within_judge_cap`].
+/// membership scan; the sole bound since round 24 (the member-count cap
+/// guarded the quadratic scan the hash oracle replaced) — see
+/// [`enum_members_within_judge_cap`].
 const ENUM_PAIR_MEMBER_BYTES_CAP: usize = 4_096;
-
-/// Member-count cap for one side's `enum` value in the pair judge's
-/// membership scan (the original round-17 bound; see
-/// [`enum_members_within_judge_cap`] for the size bound beside it).
-const ENUM_PAIR_MEMBER_CAP: usize = 256;
 
 /// Whether a schema node carries any keyword the strict judges actually
 /// judge (a declared type, pins, bounds, pattern/format, items, a
@@ -4049,18 +4196,14 @@ fn schema_pair_satisfiable(
     {
         return false;
     }
-    // The enum-vs-enum membership scan is quadratic in the member counts,
-    // and the documented subset puts no cap on `enum` — a hostile schema
-    // can park two 50,000-member disjoint enums on a nested union's shared
-    // property and pay the scan per branch pair per request. Past the cap
-    // the membership judgment is compatible-by-default, the same
-    // abstention line the unjudgeable pattern spellings draw; real
-    // discriminated unions pin a handful of members, and the per-value
-    // bounds judgment below stays live (it is linear). The same cap also
-    // bounds the per-member judgment against the other side's
-    // constraints: that scan is linear in the pinned side's member count,
-    // and a hostile enum past the cap abstains instead of paying it per
-    // branch pair.
+    // The enum-vs-enum membership scan hashes the byte-capped sides
+    // (round 24: linear, exact), and every other per-member judgment is
+    // linear in the member's own bytes — the serialized-BYTE cap alone
+    // bounds the work, so the judgment stays exact for oversized-count
+    // enums that the old quadratic scan's count cap turned away. Past the
+    // byte cap the membership judgment is converted fail-closed where a
+    // judged constraint is present (round 23), the same hostile-input
+    // line the exhaustion bounds draw.
     let enum_pair_chaseable = [a_obj, b_obj].into_iter().all(|obj| {
         obj.get("enum")
             .and_then(Value::as_array)
@@ -4123,13 +4266,32 @@ fn schema_pair_satisfiable(
         if let Some(members) = pinned.get("enum").and_then(Value::as_array) {
             if let Some(other_members) = other.get("enum").and_then(Value::as_array)
                 && enum_pair_chaseable
-                && !members.iter().any(|member| {
-                    other_members
-                        .iter()
-                        .any(|other_member| pinned_values_equal(other_member, member))
-                })
             {
-                return false;
+                // Round 24: the membership scan hashes the other side's
+                // canonical bytes instead of comparing every pair — the
+                // quadratic value-equality scan is what the member-count
+                // cap was guarding, and the hash is linear in the
+                // byte-capped total, so disjointness stays exact for the
+                // oversized-count shapes that used to abstain (a
+                // 300-vs-300-member pair whose every member differs now
+                // fails closed through the scan, and a shared member —
+                // across number spellings, via the exact canonical
+                // encoding — keeps the union shipping).
+                let other_set: std::collections::HashSet<Vec<u8>> = other_members
+                    .iter()
+                    .map(|member| {
+                        let mut bytes = Vec::new();
+                        pinned_canonical_bytes(member, &mut bytes);
+                        bytes
+                    })
+                    .collect();
+                if !members.iter().any(|member| {
+                    let mut bytes = Vec::new();
+                    pinned_canonical_bytes(member, &mut bytes);
+                    other_set.contains(&bytes)
+                }) {
+                    return false;
+                }
             }
             // Round 23: past the caps the membership and value scans below
             // skip the oversized side, and the abstention landed exactly on
@@ -5794,6 +5956,163 @@ fn validate_mfjs_enum(
     }
     Ok(())
 }
+/// Round-24 fix-wave pins: the oversize-pattern source-cap raise, the
+/// hash-based enum membership oracle (count cap retired), and the
+/// any-branch-witness union judgment with the null-family poison line.
+#[cfg(test)]
+mod strict_fixwave_r24 {
+    use super::*;
+    use serde_json::json;
+
+    fn probe_tool(name: &str, input_schema: Value) -> Tool {
+        Tool {
+            tool_type: None,
+            name: name.to_string(),
+            description: name.to_string(),
+            input_schema,
+            allowed_callers: None,
+            defer_loading: None,
+            input_examples: None,
+            strict: None,
+            cache_control: None,
+        }
+    }
+
+    fn verdict(schema: Value) -> (bool, Option<bool>) {
+        let mut tools = vec![probe_tool("probe", schema)];
+        let all = prepare_tools_for_strict_mode(&mut tools);
+        (all, tools[0].strict)
+    }
+
+    #[test]
+    fn union_with_a_dead_branch_ships_through_the_live_one() {
+        // Round 24 (A15): the property-position union is judged jointly —
+        // a dead branch (internally crossed bounds) beside a live one used
+        // to fail the whole tool closed through the per-branch descent,
+        // although the union ships satisfiable through the live branch
+        // (the same single-compatible-member leniency the enum arms draw).
+        let (all, strict) = verdict(json!({
+            "type": "object",
+            "properties": {
+                "u": {"anyOf": [
+                    {"type": "number", "minimum": 10, "maximum": 5},
+                    {"type": "string"}
+                ]}
+            },
+            "required": ["u"]
+        }));
+        assert!(all, "the live string branch witnesses the union");
+        assert_eq!(strict, Some(true));
+    }
+
+    #[test]
+    fn union_with_no_live_branch_fails_closed() {
+        // The ANY-witness must not forgive genuinely dead unions: both
+        // branches internally crossed fail the tool closed exactly as the
+        // per-branch descent did.
+        let (all, strict) = verdict(json!({
+            "type": "object",
+            "properties": {
+                "u": {"anyOf": [
+                    {"type": "number", "minimum": 10, "maximum": 5},
+                    {"type": "integer", "minimum": 10, "maximum": 5}
+                ]}
+            },
+            "required": ["u"]
+        }));
+        assert!(!all);
+        assert_eq!(strict, None);
+    }
+
+    #[test]
+    fn union_with_a_null_carrying_branch_fails_closed_despite_a_live_sibling() {
+        // The poison line: a null enum member is UNREPRESENTABLE (the
+        // strict subset cannot express null at all), not merely
+        // unsatisfiable — a witness from the sibling branch cannot make
+        // the union faithfully shippable (the round-3 null-enum-branch
+        // contract, kept through the round-24 special case).
+        let (all, strict) = verdict(json!({
+            "type": "object",
+            "properties": {
+                "u": {"anyOf": [
+                    {"enum": ["a", null]},
+                    {"type": "string"}
+                ]}
+            },
+            "required": ["u"]
+        }));
+        assert!(!all);
+        assert_eq!(strict, None);
+    }
+
+    #[test]
+    fn large_flat_pattern_is_judged_not_abstained() {
+        // Round 24: the source cap raised to 16 KB with the expansion
+        // screen carrying the cost bound — a 5 KB flat all-z pattern
+        // compiles and judges, so the violating member fails the tool
+        // closed instead of shipping strict unjudged (the round-23
+        // review's oversize-pattern witness).
+        // A ~4.5 KB flat alternation (past the old 4,096-byte source cap,
+        // inside the round-24 one) whose language excludes `xyz` but
+        // admits `abc`; the members stay small so the serialized-byte cap
+        // is not what decides.
+        let judged_pattern = format!("{}|abc", "z".repeat(4_500));
+        let (all, strict) = verdict(json!({
+            "type": "object",
+            "properties": {"a": {"type": "string", "pattern": judged_pattern, "enum": ["xyz"]}},
+            "required": ["a"]
+        }));
+        assert!(!all);
+        assert_eq!(strict, None);
+        let (all_ok, strict_ok) = verdict(json!({
+            "type": "object",
+            "properties": {"a": {"type": "string", "pattern": judged_pattern, "enum": ["abc"]}},
+            "required": ["a"]
+        }));
+        assert!(all_ok, "the matching member keeps the tool strict");
+        assert_eq!(strict_ok, Some(true));
+    }
+
+    #[test]
+    fn oversized_count_enum_disjointness_is_hash_judged() {
+        // Round 24: the membership oracle hashes canonical bytes (exact
+        // across number spellings) and is linear, so the member-count cap
+        // is retired — a 300-vs-300 disjoint pair fails through the
+        // judged scan and a shared member keeps shipping.
+        let (all, strict) = verdict(json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "properties": {"a": {"type": "integer", "enum": (0..300u32).collect::<Vec<_>>()}},
+                    "required": ["a"],
+                    "anyOf": [
+                        {"type": "object", "properties": {"a": {"type": "integer", "enum": (1_000..1_300u32).collect::<Vec<_>>()}}, "required": ["a"]}
+                    ]
+                }
+            },
+            "required": ["spec"]
+        }));
+        assert!(!all);
+        assert_eq!(strict, None);
+        let (all_shared, strict_shared) = verdict(json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "properties": {"a": {"type": "integer", "enum": [2, 500]}},
+                    "required": ["a"],
+                    "anyOf": [
+                        {"type": "object", "properties": {"a": {"type": "integer", "enum": [2.0, 900]}}, "required": ["a"]}
+                    ]
+                }
+            },
+            "required": ["spec"]
+        }));
+        assert!(all_shared, "`2` and `2.0` are one canonical value");
+        assert_eq!(strict_shared, Some(true));
+    }
+}
 /// Round-23 fix-wave pins: each rule the wave added turns at least one pin
 /// here red when neutered (mutation-verified before the wave was trusted).
 #[cfg(test)]
@@ -6330,7 +6649,7 @@ mod strict_fixwave_r23 {
         let hostile = format!("{}z", "(a{1,100})".repeat(8));
         assert!(
             super::compile_documented_pattern(&hostile).is_none(),
-            "the nested-bounded repeat aborts at the compiled-program cap"
+            "the nested-bounded repeat is rejected by the expansion screen"
         );
         assert!(
             super::compile_documented_pattern("^a[0-9]+z$").is_some(),
@@ -12221,15 +12540,10 @@ mod tests {
     }
 
     #[test]
-    fn strict_mode_judges_enum_disjointness_at_the_exact_pair_cap() {
-        // Cap boundary: 256-member disjoint enums are still chased (the
-        // intersection scan runs at the boundary) and fail the union
-        // closed. Round-23 REVERSAL of the 257 half: past the cap the
-        // judgment used to abstain and keep shipping; with the declared
-        // types present the honest verdict is fail-closed, so both edges
-        // fail now — through the judged scan below the cap, through the
-        // exhaustion conversion above it. Pinning both edges keeps the
-        // constant's value from drifting silently in either direction.
+    fn strict_mode_judges_enum_disjointness_across_the_old_count_cap() {
+        // The count boundary no longer changes the verdict (round 24: the
+        // hash oracle judges both sides exactly — disjoint fails closed
+        // through the scan at any count inside the byte cap).
         for (count, should_ship) in [(256usize, false), (257, false)] {
             let members: Vec<Value> = (0..count as u32).map(Value::from).collect();
             let others: Vec<Value> = (1_000..1_000 + count as u32).map(Value::from).collect();
@@ -12256,6 +12570,65 @@ mod tests {
                 "{count}-member disjoint enums: judged below the cap,                  fail-closed past it"
             );
         }
+    }
+
+    #[test]
+    fn strict_mode_judges_oversized_count_enum_pairs_exactly() {
+        // Round-24 successor of the 256/257 boundary pin: the hash
+        // membership oracle is linear, so oversized-COUNT disjoint enums
+        // (300 vs 300, well inside the serialized-byte cap) are judged
+        // through the scan and fail the union closed, while an
+        // oversized-count pair SHARING a member — across number spellings,
+        // via the exact canonical encoding that reads `2` and `2.0` as one
+        // value — keeps shipping. The byte cap stays the work bound:
+        // shrinking it flips both halves to the round-23 conversion (same
+        // verdicts, different mechanism).
+        let members: Vec<Value> = (0..300u32).map(Value::from).collect();
+        let others: Vec<Value> = (1_000..1_300u32).map(Value::from).collect();
+        let mut tool = test_tool(
+            "probe",
+            json!({
+                "type": "object",
+                "properties": {
+                    "spec": {
+                        "type": "object",
+                        "properties": {"a": {"type": "integer", "enum": members}},
+                        "required": ["a"],
+                        "anyOf": [
+                            {"type": "object", "properties": {"a": {"type": "integer", "enum": others}}, "required": ["a"]}
+                        ]
+                    }
+                },
+                "required": ["spec"]
+            }),
+        );
+        assert!(
+            !prepare_tools_for_strict_mode(std::slice::from_mut(&mut tool)),
+            "oversized-count disjoint enums are judged and fail closed"
+        );
+        let mut shared = test_tool(
+            "probe",
+            json!({
+                "type": "object",
+                "properties": {
+                    "spec": {
+                        "type": "object",
+                        "properties": {"a": {"type": "integer", "enum": [2, 500]}},
+                        "required": ["a"],
+                        "anyOf": [
+                            {"type": "object", "properties": {"a": {"type": "integer", "enum": [2.0, 900]}}, "required": ["a"]}
+                        ]
+                    }
+                },
+                "required": ["spec"]
+            }),
+        );
+        assert!(
+            prepare_tools_for_strict_mode(std::slice::from_mut(&mut shared)),
+            "oversized-count enums sharing a member across number spellings \
+             keep the union shipping"
+        );
+        assert_eq!(shared.strict, Some(true));
     }
 
     #[test]
@@ -12344,15 +12717,35 @@ mod tests {
     }
 
     #[test]
-    fn strict_mode_abstains_from_an_oversized_pattern_source() {
-        // The pattern judge compiles per node (or per pair call), and
-        // compile cost scales with the pattern source: past the source
-        // bound the judge abstains compatible-by-default (the pattern
-        // still ships and binds), so a member the oversized pattern would
-        // have excluded no longer fails the tool closed. The small-
-        // pattern twin is pinned by the pattern judge pins.
-        let big_pattern = format!("{}$", "z".repeat(4_999));
+    fn strict_mode_judges_a_large_flat_pattern_and_abstains_past_the_source_cap() {
+        // Round-24 REVERSAL of the oversize abstention pin: the source cap
+        // was the round-21 compile-cost bound, but compile cost is
+        // expansion-driven and the expansion screen (round 23) now carries
+        // that bound — a large FLAT pattern compiles in fractions of a
+        // millisecond, so raising the source cap to 16 KB moves this
+        // shape from abstain-compatible (member shipped strict unjudged:
+        // the round-23 review's oversize-pattern witness) to exact
+        // judging: `abc` violates the 5 KB all-z pattern and fails the
+        // tool closed. Past the source cap the abstention remains (the
+        // pattern still ships and binds on the wire), pinned by the twin
+        // below.
+        let judged_pattern = format!("{}$", "z".repeat(4_999));
         let mut tool = test_tool(
+            "probe",
+            json!({
+                "type": "object",
+                "properties": {"a": {"type": "string", "pattern": judged_pattern, "enum": ["abc"]}},
+                "required": ["a"]
+            }),
+        );
+        assert!(
+            !prepare_tools_for_strict_mode(std::slice::from_mut(&mut tool)),
+            "a large flat pattern is compiled and judged: the violating \
+             member fails the tool closed"
+        );
+        assert_eq!(tool.strict, None);
+        let big_pattern = format!("{}$", "z".repeat(20_000));
+        let mut abstained = test_tool(
             "probe",
             json!({
                 "type": "object",
@@ -12360,10 +12753,12 @@ mod tests {
                 "required": ["a"]
             }),
         );
-        assert!(prepare_tools_for_strict_mode(std::slice::from_mut(
-            &mut tool
-        )));
-        assert_eq!(tool.strict, Some(true));
+        assert!(
+            prepare_tools_for_strict_mode(std::slice::from_mut(&mut abstained)),
+            "past the source cap the judge abstains and the pattern binds \
+             on the wire"
+        );
+        assert_eq!(abstained.strict, Some(true));
     }
 
     #[test]
@@ -12684,17 +13079,16 @@ mod tests {
     }
 
     #[test]
-    fn strict_mode_node_level_enum_scan_fails_closed_past_the_member_cap() {
-        // The node-level enum scan draws the same hostile-input line the
-        // pair judge draws: within the 256-member cap a member set none of
-        // which satisfies the node fails the tool closed. Round-23
-        // REVERSAL of the past-cap half: the members all violate the
-        // node's `properties` judgment (`x` is a string, every member
-        // carries a number), so the skipped scan could have proven the
-        // node unsatisfiable — with that judged constraint present the
-        // honest verdict is fail-closed instead of the old abstention.
-        // Neutering the conversion flips the 257 half; shrinking the cap
-        // flips the 256 half.
+    fn strict_mode_node_level_enum_scan_fails_closed_on_violating_members() {
+        // The node-level enum scan judges violating member sets fail-closed
+        // at any count (round 24: the member-count cap is gone — the hash
+        // membership oracle and the linear per-member judgments are bounded
+        // by the serialized-BYTE cap alone, so 256 and 257 members are both
+        // fully judged here and every member violates the node's
+        // `properties` judgment, `x` being a string). Shrinking the byte
+        // cap flips the larger set to the round-23 exhaustion conversion —
+        // same verdict, different mechanism; neutering the scan's property
+        // judgment flips both halves green.
         let make = |count: usize| {
             let members: Vec<Value> = (0..count).map(|_| json!({"x": 1})).collect();
             test_tool(
@@ -12707,17 +13101,18 @@ mod tests {
                 }),
             )
         };
-        let mut judged = make(ENUM_PAIR_MEMBER_CAP);
+        let mut judged = make(256);
         assert!(
             !prepare_tools_for_strict_mode(std::slice::from_mut(&mut judged)),
             "a fully judged member set that admits nothing fails closed"
         );
-        let mut converted = make(ENUM_PAIR_MEMBER_CAP + 1);
+        let mut judged_too = make(257);
         assert!(
-            !prepare_tools_for_strict_mode(std::slice::from_mut(&mut converted)),
-            "past the member cap with a judged constraint present the tool              fails closed instead of abstaining"
+            !prepare_tools_for_strict_mode(std::slice::from_mut(&mut judged_too)),
+            "the count boundary no longer changes the verdict: judged either \
+             way, violating members fail closed"
         );
-        assert_eq!(converted.strict, None);
+        assert_eq!(judged_too.strict, None);
     }
 
     #[test]
