@@ -13946,3 +13946,17 @@ fn strict_tool_mode_for_route_combines_the_flag_with_the_official_route_gate() {
         "https://llm.example.com/v1"
     ));
 }
+
+#[test]
+fn official_host_gate_rejects_an_interior_empty_path_segment() {
+    assert!(!url_is_official_deepseek_host(
+        "https://api.deepseek.com//v1"
+    ));
+    assert!(!url_is_official_deepseek_host(
+        "https://api.deepseek.com/v1//chat"
+    ));
+    // A single trailing slash stays admitted (route identity folds it).
+    assert!(url_is_official_deepseek_host(
+        "https://api.deepseek.com/v1/"
+    ));
+}

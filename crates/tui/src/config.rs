@@ -1090,6 +1090,16 @@ pub fn url_is_official_deepseek_host(base_url: &str) -> bool {
         if rest.contains('%') || rest.contains('\\') {
             return false;
         }
+        // An empty path segment merges away under slash-collapsing proxies:
+        // `https://api.deepseek.com//v1` lands on the canonical non-beta
+        // `/v1` endpoint while the strict flag was kept for the literal
+        // path — the same normalization drift the dot-segment and
+        // percent-encoded rejections close. A single trailing slash stays
+        // legal (the route identity folds it), so only INTERIOR empty
+        // segments reject.
+        if rest.contains("//") {
+            return false;
+        }
         !rest
             .split('/')
             .any(|segment| segment == "." || segment == "..")

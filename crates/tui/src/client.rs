@@ -2412,7 +2412,7 @@ fn provider_default_wire_format(api_provider: ApiProvider) -> WireFormat {
 /// honor `wire = "responses" | "anthropic" | "chat"` per-config (see
 /// `crates/config/src/provider.rs:Custom`). Everyone else keeps the descriptor's
 /// fixed policy (or Chat Completions).
-fn provider_wire_format_for_config(
+pub(crate) fn provider_wire_format_for_config(
     api_provider: ApiProvider,
     config: Option<&crate::config::Config>,
 ) -> WireFormat {
