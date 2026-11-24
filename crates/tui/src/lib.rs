@@ -4737,7 +4737,12 @@ async fn run_doctor(
         }
     }
     let tls_status = doctor_tls_status(config);
-    if !tls_status.certificate_verification {
+    // Round 23: the human branch keyed on `certificate_verification`, a
+    // field that is const `true` (verification cannot be disabled), so a
+    // configured `insecure_skip_tls_verify` was disclosed only in the JSON
+    // message while the client hard-refuses the insecure route. Key the
+    // human disclosure on the configured flag itself.
+    if tls_status.insecure_skip_tls_verify {
         println!("  ! {}", tls_status.message);
         println!("    Prefer SSL_CERT_FILE with a trusted custom CA bundle when possible.");
     }
@@ -4756,19 +4761,27 @@ async fn run_doctor(
     if let Some(recommended) = strict_tool_mode.recommended_base_url.as_deref() {
         println!("{}", strict_recommendation_line(recommended));
     }
-    let capability = crate::config::provider_capability(config.api_provider(), &api_target.model);
+    // Round 23: the human alias line and the probe decision answer from
+    // the launch identity (the same scoping the JSON capability section
+    // uses), not from the raw root the session may not serve.
+    let (human_provider, human_identity, _human_model) = doctor_launch_surface(config);
+    let mut human_scoped = config.clone();
+    human_scoped.scope_to_provider_identity(&human_identity);
+    let capability = crate::config::provider_capability_with_wire(
+        human_provider,
+        &api_target.model,
+        human_scoped.provider_wire_dialect(human_provider),
+    );
     if let Some(alias) = capability.alias_deprecation.as_ref() {
         println!(
             "  ! model alias {} retires {}; switch to {}",
             alias.alias, alias.retirement_date, alias.replacement
         );
     }
-    let live_api_requested =
-        doctor_should_probe_api(config.api_provider(), &api_target.base_url, probes);
-    let endpoint_is_local = crate::config::provider_route_is_keyless_self_hosted(
-        config.api_provider(),
-        &api_target.base_url,
-    ) || crate::config::base_url_uses_local_host(&api_target.base_url);
+    let live_api_requested = doctor_should_probe_api(human_provider, &api_target.base_url, probes);
+    let endpoint_is_local =
+        crate::config::provider_route_is_keyless_self_hosted(human_provider, &api_target.base_url)
+            || crate::config::base_url_uses_local_host(&api_target.base_url);
     if doctor_should_probe_auth(config) && live_api_requested {
         print!("  {} Testing connection...", "·".dimmed());
         use std::io::Write;
@@ -7201,6 +7214,15 @@ fn provider_capability_report(config: &Config) -> serde_json::Value {
     // the raw root named a provider no session serves and reported its
     // capabilities on the served section's lines (round-22 residual).
     let (provider, identity, configured_model) = doctor_launch_surface(config);
+    // Round 23 (M10): the dialect the client speaks resolves from the
+    // identity-scoped config — the client is built post-scope — so the
+    // capability read takes the identity's table, not the raw root's (the
+    // r22 identity edit made `provider` the launch provider while the
+    // dialect read stayed on the raw root: the two halves of the same
+    // section answered from different configs).
+    let mut scoped_config = config.clone();
+    scoped_config.scope_to_provider_identity(&identity);
+    let scoped_config = &scoped_config;
     let route_result = crate::route_runtime::resolve_runtime_route_for_identity(
         config,
         &identity,
@@ -7219,7 +7241,7 @@ fn provider_capability_report(config: &Config) -> serde_json::Value {
     let cap = crate::config::provider_capability_with_wire(
         provider,
         resolved_model,
-        config.provider_wire_dialect(provider),
+        scoped_config.provider_wire_dialect(provider),
     );
     let route_profile = route.as_ref().map(|route| {
         crate::model_profile::resolved_capability_profile_for_route(
@@ -7263,12 +7285,39 @@ fn provider_capability_report(config: &Config) -> serde_json::Value {
         .map_or(cap.cache_telemetry_supported, |profile| {
             profile.prompt_caching.is_supported()
         });
-    let request_payload_mode = route_profile
-        .as_ref()
-        .map_or(cap.request_payload_mode, |profile| {
-            profile.request_payload_mode
-        });
-    let alias_deprecation = config.active_deepseek_alias_deprecation();
+    // The payload mode the client actually speaks, in precedence order:
+    // a Custom table's wire override (the resolver honors it —
+    // `route_runtime.rs::custom_wire_override`), else the resolved
+    // endpoint's own protocol (a catalog model that resolves to the
+    // Responses endpoint speaks Responses even where the profile row says
+    // chat), else the catalog profile, else the compatibility matrix
+    // (round 23 — the profile used to override the wire-aware value
+    // unconditionally, reporting a dialect no live client spoke).
+    let wire_override_present = provider == crate::config::ApiProvider::Custom
+        && scoped_config.provider_wire_dialect(provider).is_some();
+    let request_payload_mode = if wire_override_present {
+        cap.request_payload_mode
+    } else {
+        route_profile
+            .as_ref()
+            .map(|profile| profile.request_payload_mode)
+            .unwrap_or_else(|| {
+                route.as_ref().map_or(cap.request_payload_mode, |route| {
+                    match route.candidate.protocol() {
+                        codewhale_config::provider::WireFormat::Responses => {
+                            crate::config::RequestPayloadMode::Responses
+                        }
+                        codewhale_config::provider::WireFormat::AnthropicMessages => {
+                            crate::config::RequestPayloadMode::AnthropicMessages
+                        }
+                        codewhale_config::provider::WireFormat::ChatCompletions => {
+                            cap.request_payload_mode
+                        }
+                    }
+                })
+            })
+    };
+    let alias_deprecation = scoped_config.active_deepseek_alias_deprecation();
 
     json!({
         "resolved_provider": identity.key,
@@ -7332,7 +7381,7 @@ fn doctor_route_report(config: &Config) -> serde_json::Value {
         },
         "model": target.model,
         "route_identity": route_identity,
-        "wire_protocol": doctor_wire_protocol(provider),
+        "wire_protocol": doctor_effective_wire_protocol(config, provider),
         "base_url": {
             "redacted": redacted_base_url,
             "class": doctor_base_url_class(provider, &target.base_url),
@@ -7360,6 +7409,29 @@ fn doctor_provider_config_table(config: &Config, provider: crate::config::ApiPro
 }
 
 fn doctor_provider_source(config: &Config) -> &'static str {
+    // Which surface supplied the served provider: a settings
+    // `default_provider` re-point wins at launch (the `/model` →
+    // "Remember as my default" band), so a label that only inspects the
+    // raw document's `provider` field mislabels a settings-served route as
+    // `config` (round 23). The detection mirrors `doctor_launch_identity`'s
+    // precedence: explicit override > fleet > settings re-point > raw
+    // config > default.
+    if crate::config::explicit_launch_provider_override().is_some() {
+        return "override";
+    }
+    let settings_provider = crate::settings::Settings::load_persisted_read_only()
+        .ok()
+        .and_then(|launch_settings| launch_settings.default_provider)
+        .filter(|provider_str| config.resolve_provider_identity(provider_str).is_ok());
+    if !config.fleet_operator_route_applied
+        && let Some(settings_provider) = settings_provider
+        && config
+            .provider
+            .as_ref()
+            .is_none_or(|raw| raw.trim() != settings_provider)
+    {
+        return "settings";
+    }
     if config
         .provider
         .as_ref()
@@ -7371,18 +7443,23 @@ fn doctor_provider_source(config: &Config) -> &'static str {
     }
 }
 
-fn doctor_wire_protocol(provider: crate::config::ApiProvider) -> &'static str {
-    let policy = provider
-        .metadata()
-        .map(|metadata| metadata.wire_policy())
-        .unwrap_or(codewhale_config::provider::WirePolicy::Fixed(
-            codewhale_config::provider::WireFormat::ChatCompletions,
-        ));
-    match policy.fixed() {
-        Some(codewhale_config::provider::WireFormat::ChatCompletions) => "chat_completions",
-        Some(codewhale_config::provider::WireFormat::Responses) => "responses",
-        Some(codewhale_config::provider::WireFormat::AnthropicMessages) => "anthropic_messages",
-        None => "model_aware",
+/// The route report's wire line: the dialect dispatch actually resolves —
+/// the same composition the client construction and the strict verdicts
+/// answer from, read from the identity-scoped config — rather than the
+/// static metadata policy, which answered `chat_completions` for a Custom
+/// identity whose table overrides the wire and keyed the raw root's table
+/// under a settings re-point (round 23).
+fn doctor_effective_wire_protocol(
+    config: &Config,
+    provider: crate::config::ApiProvider,
+) -> &'static str {
+    let identity = doctor_launch_identity(config);
+    let mut scoped = config.clone();
+    scoped.scope_to_provider_identity(&identity);
+    match crate::client::provider_wire_format_for_config(provider, Some(&scoped)) {
+        codewhale_config::provider::WireFormat::ChatCompletions => "chat_completions",
+        codewhale_config::provider::WireFormat::Responses => "responses",
+        codewhale_config::provider::WireFormat::AnthropicMessages => "anthropic_messages",
     }
 }
 
@@ -7407,6 +7484,14 @@ fn doctor_base_url_class(provider: crate::config::ApiProvider, base_url: &str) -
 }
 
 fn doctor_auth_scheme(config: &Config) -> &'static str {
+    // The scheme the SERVED route speaks: the launch identity scopes the
+    // config before any provider read, the same mechanism the credential
+    // source line beside this one uses (round 23 — the raw root's table
+    // answered `bearer`/`x-api-key` while the served route sent no auth).
+    let identity = doctor_launch_identity(config);
+    let mut scoped = config.clone();
+    scoped.scope_to_provider_identity(&identity);
+    let config = &scoped;
     let provider = config.api_provider();
     if crate::config::auth_mode_disables_api_key(config.auth_mode_for_provider(provider).as_deref())
     {
@@ -7705,16 +7790,21 @@ fn doctor_strict_tool_mode_status(config: &Config) -> DoctorStrictToolModeStatus
     // selector fix `doctor_launch_surface` makes).
     let (launch_provider, launch_identity, _launch_model) = doctor_launch_surface(config);
     // The effective wire the client itself resolves (`client.rs` →
-    // `provider_wire_format_for_config`): family typing AND the configured
-    // dialect feed it, so the doctor cannot disagree with the wire about
-    // which dialect carries the payload — a `wire = "anthropic"` override
-    // on a family table gets the Anthropic verdict (the Messages wire
-    // forwards `tool_choice` unconditionally, so the chat-suppression
-    // parenthetical would quote an omission that never happens), and an
-    // inert `wire = "responses"` on a family table keeps the chat
-    // parenthetical (the override is honored for custom tables only).
+    // `provider_wire_format_for_config`). Two round-23 corrections: the
+    // client resolves the dialect from the IDENTITY-SCOPED config (it is
+    // built post-scope), so the verdict reads the scoped clone — the raw
+    // root's table keyed a Custom re-point and quoted a chat-dialect
+    // parenthetical the session's Responses wire never performs — and the
+    // dialect composition itself no longer honors `wire` on family
+    // (model-aware) tables, because the route resolver builds a wire
+    // override for Custom tables only (`route_runtime.rs`); a
+    // `wire = "anthropic"` on `[providers.deepseek]` used to get the
+    // Messages verdict here while every live dispatch path kept speaking
+    // chat.
+    let mut scoped_config = config.clone();
+    scoped_config.scope_to_provider_identity(&launch_identity);
     let effective_wire =
-        crate::client::provider_wire_format_for_config(launch_provider, Some(config));
+        crate::client::provider_wire_format_for_config(launch_provider, Some(&scoped_config));
     // Answer from the same composition the engine and sub-agent gates use
     // (`strict_tool_mode_for_route`): the flag plus provider typing plus the
     // official host. Classifying the URL alone made the Beta arm claim strict
@@ -7864,7 +7954,7 @@ fn doctor_strict_tool_mode_status(config: &Config) -> DoctorStrictToolModeStatus
             // request does not go where "use the beta endpoint" says — the
             // flag itself is unaffected (the strip keys on the canonical
             // base URL, which no strip set touches here).
-            let endpoint_sentence = if config
+            let endpoint_sentence = if scoped_config
                 .provider_config_for(launch_provider)
                 .and_then(|provider_config| provider_config.path_suffix.clone())
                 .is_some()
@@ -7883,7 +7973,9 @@ fn doctor_strict_tool_mode_status(config: &Config) -> DoctorStrictToolModeStatus
                     "{endpoint_sentence} `tool_choice` stays `required` (omitted on \
                      thinking-enabled requests, where the chat dialect suppresses it); \
                      per-tool schemas that cannot conform ship unchanged and non-strict; \
-                     child sub-agents always send `tool_choice: auto`"
+                     child sub-agents request `tool_choice: auto` (the chat dialect omits it on \
+                     thinking-enabled requests, the same suppression the parent's \
+                     `required` faces)"
                 ),
                 recommended_base_url: None,
             }
@@ -7905,7 +7997,9 @@ fn doctor_strict_tool_mode_status(config: &Config) -> DoctorStrictToolModeStatus
                           `tool_choice` stays `required` (omitted on thinking-enabled \
                           requests, where the chat dialect suppresses it); per-tool \
                           schemas that cannot conform ship unchanged and non-strict; \
-                          child sub-agents always send `tool_choice: auto`"
+                          child sub-agents request `tool_choice: auto` (the chat dialect omits it on \
+                     thinking-enabled requests, the same suppression the parent's \
+                     `required` faces)"
                     .to_string(),
                 recommended_base_url: Some(recommended.to_string()),
             }
@@ -7930,7 +8024,9 @@ fn doctor_strict_tool_mode_status(config: &Config) -> DoctorStrictToolModeStatus
                       (omitted on thinking-enabled requests, where the chat \
                       dialect suppresses it); per-tool schemas that cannot \
                       conform ship unchanged and non-strict; \
-                      child sub-agents always send `tool_choice: auto`"
+                      child sub-agents request `tool_choice: auto` (the chat dialect omits it on \
+                     thinking-enabled requests, the same suppression the parent's \
+                     `required` faces)"
                 .to_string(),
             recommended_base_url: None,
         },
@@ -21143,12 +21239,19 @@ mod strict_doctor_fixwave_r22 {
 
     #[test]
     fn doctor_wire_override_keys_the_notes_on_the_effective_wire() {
-        // A family table with `wire = "anthropic"`: the client speaks the
-        // Anthropic Messages dialect (which forwards `tool_choice`
-        // unconditionally), so the verdict must come from the wire-keyed
-        // arm — no chat-suppression parenthetical, which would quote an
-        // omission that never happens (the round-22 review's probe ran
-        // this exact shape and got the chat sentence).
+        // Round-23 REVERSAL of the round-22 pin: the route resolver builds
+        // a wire override for Custom tables only
+        // (`route_runtime.rs::custom_wire_override`), so a
+        // `wire = "anthropic"` on a FAMILY table is inert on every live
+        // dispatch path — the client speaks chat, strips `function.strict`
+        // on the canonical non-beta endpoint, and suppresses
+        // `tool_choice` on thinking-enabled requests. The round-22 pin
+        // asserted the Messages verdict here ("the client speaks the
+        // Anthropic Messages dialect"), which the round-23 live-dispatch
+        // probe proved false; the doctor now keys the notes on the dialect
+        // dispatch actually resolves. The Custom half of the override —
+        // the part the resolver honors — keeps the round-22 behavior
+        // (`strict_tool_mode_doctor_drops_the_thinking_clause_when_the_wire_overrides`).
         let config = Config {
             provider: Some("deepseek".to_string()),
             providers: Some(crate::config::ProvidersConfig {
@@ -21162,15 +21265,162 @@ mod strict_doctor_fixwave_r22 {
             ..Default::default()
         };
         let status = doctor_strict_tool_mode_status(&config);
-        assert_eq!(
-            status.status, "official_route",
-            "the wire-keyed arm answers the dialect override: {:?}",
-            status.status
-        );
+        // The fixture's default table URL is the /anthropic path
+        // (non-canonical official host), so the URL arm is
+        // `official_route` — what changed is the DIALECT the notes speak:
+        // the chat-dialect disclosures, not the Messages verdict the
+        // round-22 pin asserted while every live dispatch path spoke chat.
+        assert_eq!(status.status, "official_route", "{:?}", status.status);
         assert!(status.function_strict_sent);
         assert!(
-            !status.message.contains("omitted on"),
-            "no chat-suppression parenthetical on the Messages wire: {}",
+            status.message.contains("omitted on"),
+            "the chat dialect suppresses tool_choice on thinking-enabled \
+             requests — the parenthetical the round-22 pin rejected for a \
+             dialect no live client spoke: {}",
+            status.message
+        );
+        assert!(
+            !status.message.contains("Anthropic wire forwards"),
+            "no Messages-dialect claim: the resolver honors the override \
+             for Custom tables only: {}",
+            status.message
+        );
+    }
+
+    fn responses_repoint_fixture() -> (
+        tempfile::TempDir,
+        Config,
+        crate::test_support::EnvVarGuard,
+        crate::test_support::TestEnvLock,
+    ) {
+        // The round-22 re-point fixture with the ds4 table speaking the
+        // Responses wire and carrying no auth: the shape the raw-root
+        // reads mislabeled (the raw root's chat table answered for a
+        // session whose wire is Responses and which sends no credentials).
+        let (tmp, mut config, home, env_lock) = repoint_fixture();
+        let ds4 = config
+            .providers
+            .as_mut()
+            .expect("fixture providers")
+            .custom
+            .get_mut("ds4")
+            .expect("fixture ds4 table");
+        ds4.wire = Some("responses".to_string());
+        ds4.auth_mode = Some("none".to_string());
+        (tmp, config, home, env_lock)
+    }
+
+    #[test]
+    fn strict_verdict_reads_the_wire_from_the_scoped_identity() {
+        // Round 23 (M9): the live client resolves the dialect from the
+        // identity-scoped config, so the verdict must too — the raw root's
+        // chat table keyed the Custom re-point and quoted the chat-dialect
+        // thinking-suppression parenthetical for a session whose wire is
+        // Responses (which sends `tool_choice` unconditionally).
+        let (_tmp, config, _home, _env_lock) = responses_repoint_fixture();
+        let status = doctor_strict_tool_mode_status(&config);
+        assert_eq!(status.status, "custom_endpoint", "{:?}", status.status);
+        assert!(
+            !status
+                .message
+                .contains("omitted on thinking-enabled requests"),
+            "the Responses wire sends `tool_choice` unconditionally — the \
+             chat-suppression parenthetical must be absent: {}",
+            status.message
+        );
+        assert!(status.message.contains("falls back to `auto`"));
+    }
+
+    #[test]
+    fn capability_payload_mode_names_the_session_wire() {
+        // Round 23 (M10): the capability section reports the payload the
+        // client actually speaks — the Custom table's wire override (the
+        // resolver honors it) — not the raw root's dialect or the catalog
+        // profile that used to override the wire-aware value.
+        let (_tmp, config, _home, _env_lock) = responses_repoint_fixture();
+        let report = provider_capability_report(&config);
+        assert_eq!(report["resolved_provider"], "ds4");
+        assert_eq!(
+            report["request_payload_mode"], "Responses",
+            "the ds4 table's wire override is what dispatch speaks: {}",
+            report
+        );
+    }
+
+    #[test]
+    fn route_auth_scheme_reads_the_served_table() {
+        // Round 23 (M11): the auth-scheme line answers from the launch
+        // identity like the credential source beside it — the raw root
+        // named `bearer` for a custom table while the served ds4 route
+        // sends no auth (`auth_mode = "none"`).
+        let (_tmp, config, _home, _env_lock) = responses_repoint_fixture();
+        let report = doctor_route_report(&config);
+        assert_eq!(report["provider"], "ds4");
+        assert_eq!(
+            report["auth"]["scheme"], "none",
+            "the served ds4 route sends no auth: {}",
+            report
+        );
+    }
+
+    #[test]
+    fn provider_source_names_the_settings_repoint() {
+        // Round 23: `provider_source` distinguishes a settings-served
+        // provider from one the raw config document supplied — the raw
+        // inspect-only label said `config` for a route settings chose.
+        let (_tmp, config, _home, _env_lock) = repoint_fixture();
+        let report = doctor_route_report(&config);
+        assert_eq!(report["provider"], "ds4");
+        assert_eq!(
+            report["provider_source"], "settings",
+            "the served provider came from settings.default_provider: {}",
+            report
+        );
+    }
+
+    #[test]
+    fn wire_protocol_names_the_session_dialect() {
+        // Round 23: the route report's wire line reports the dialect
+        // dispatch resolves (the Custom table's Responses override), not
+        // the static metadata policy's chat default.
+        let (_tmp, config, _home, _env_lock) = responses_repoint_fixture();
+        let report = doctor_route_report(&config);
+        assert_eq!(
+            report["wire_protocol"], "responses",
+            "the served route speaks the ds4 table's wire override: {}",
+            report
+        );
+    }
+
+    #[test]
+    fn strict_tool_mode_doctor_child_sentence_discloses_the_thinking_suppression() {
+        // Round 23: the child sentence no longer claims the child's
+        // `tool_choice: auto` always reaches the wire — the chat dialect
+        // omits it on thinking-enabled requests exactly as it omits the
+        // parent's `required` (probed through the real wire builder in the
+        // round-23 review).
+        let config = Config {
+            strict_tool_mode: Some(true),
+            ..Default::default()
+        };
+        let status = doctor_strict_tool_mode_status(&config);
+        assert_eq!(status.status, "ready");
+        assert!(status.function_strict_sent);
+        assert!(
+            status
+                .message
+                .contains("child sub-agents request `tool_choice: auto`"),
+            "the child sentence is present: {}",
+            status.message
+        );
+        assert!(
+            status.message.contains("the chat dialect omits it on"),
+            "the child sentence discloses the thinking suppression: {}",
+            status.message
+        );
+        assert!(
+            !status.message.contains("always send"),
+            "the unconditional claim is retired: {}",
             status.message
         );
     }

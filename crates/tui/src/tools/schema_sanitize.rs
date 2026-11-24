@@ -258,11 +258,11 @@ pub(crate) const STRICT_REMOVAL_CONTEXT_NOTES: &[(&str, &str)] = &[
     (
         "task_shell_wait",
         "In strict mode explicit waits and gate-evidence recording are \
-         unavailable from this tool: `wait`, `timeout_ms`, and `gate` are \
-         no longer accepted, so a wait returns as soon as the task \
-         finishes on its own and a completed task cannot be recorded as \
-         gate evidence here (the `tasks` tool's `gate_run` action still \
-         records evidence).",
+         unavailable from this tool: `wait`, `timeout_ms`, `gate`, and \
+         `command` are no longer accepted, so a wait returns as soon as \
+         the task finishes on its own and a completed task cannot be \
+         recorded as gate evidence here (the `tasks` tool's `gate_run` \
+         action still records evidence).",
     ),
     (
         "read_media",
@@ -346,20 +346,22 @@ const STRICT_REF_MAX_HOPS: usize = 16;
 /// hop, member, and alternative caps draw.
 const STRICT_PAIR_JUDGE_MAX_DEPTH: usize = 128;
 
-/// Total pair-judge call budget per judged pair (one `&mut` created at the
-/// coverage arm and shared `&mut` across the whole recursion from there,
-/// branches included): the depth bound keeps the stack finite, but a
-/// cycle's abstention at the depth cap unwinds as `true` and each unwound
-/// level fires its own sibling/properties recursion — an exponential call
-/// tree the depth bound does not touch. The same explosion exists without
-/// any cycle: an OR-tree of bare `anyOf` wrappers whose every leaf is
-/// disjoint from the covering branch explores 2^depth pair calls from a
-/// ~2 KB document. The budget caps the TOTAL work per coverage judgment at
-/// a constant, and a legitimate document spends a handful of calls per
-/// shared property (the real catalog's worst case is double digits, so the
-/// cap keeps an order of magnitude of headroom). Past the budget the judge
-/// abstains compatible-by-default like every other hostile-input bound.
-const STRICT_PAIR_JUDGE_CALL_BUDGET: usize = 256;
+/// Total pair-judge call budget per REQUEST PREPARATION, taken by each
+/// coverage/composition judgment and handed back after it (see
+/// [`pair_budget_take`]; round 23 — the budget used to be created fresh
+/// per judged pair, and a fresh budget at every composition node let a
+/// wide schema pay nodes × 256 pair calls per request, measured 1.34 s
+/// per request for a ~1 MB 3,000-node document). The depth bound keeps
+/// the stack finite, but an abstention at either bound used to unwind as
+/// `true`, and each unwound level fired its own sibling/properties
+/// recursion — the exponential call tree the budget now stops, and the
+/// exhaustion verdict itself is fail-closed where a judged constraint is
+/// present (round 23; the abstention landed exactly on the unsatisfiable
+/// case). 1024 keeps ordinary schemas — hundreds of composition nodes,
+/// the real catalog's worst shared-property judgment being double digits
+/// — fully judged, while a hostile OR-tree of disjoint wrappers exhausts
+/// into that fail-closed instead of shipping strict callable by nothing.
+const STRICT_PAIR_JUDGE_CALL_BUDGET: usize = 1024;
 
 /// The literal-keyword keys whose values are DATA (enum members, defaults,
 /// examples), not schemas. Shared by every walker alongside
@@ -401,10 +403,11 @@ pub(crate) const STRICT_LITERAL_KEYS: &[&str] =
 /// follows DeepSeek's strict-mode documents and would strip keywords other
 /// providers document (e.g. `minItems`/`maxItems` on OpenAI).
 pub fn prepare_tools_for_strict_mode(tools: &mut [Tool]) -> bool {
-    // One compile budget per request preparation: the counter is the
-    // memo's per-request work bound, so it resets here, on the boundary
-    // one preparation per model round draws.
+    // One compile budget and one pair-judge budget per request preparation:
+    // the counters are the per-request work bounds, so they reset here, on
+    // the boundary one preparation per model round draws.
     PATTERN_COMPILES_THIS_REQUEST.with(|counter| counter.set(0));
+    PAIR_JUDGE_CALLS_LEFT.with(|cell| cell.set(STRICT_PAIR_JUDGE_CALL_BUDGET));
     let mut all_strict = true;
     for tool in tools {
         if STRICT_UNUSABLE_TOOLS.contains(&tool.name.as_str()) {
@@ -1991,7 +1994,7 @@ pub fn sanitize_for_anthropic_messages(schema: &mut Value) -> Option<String> {
                 items.iter().filter_map(required_group_names).collect();
             groups.sort_by(|a, b| a.0.cmp(&b.0));
             groups.dedup_by(|a, b| a.0 == b.0);
-            if groups.len() >= 2 {
+            if !groups.is_empty() {
                 let total = groups.len();
                 let mut list: Vec<String> = groups
                     .iter()
@@ -2381,9 +2384,17 @@ fn has_strict_incompatible_composition(schema: &Value, root: &Value, is_root: bo
                     union_properties.keys().map(String::as_str).collect();
                 // One call budget for the whole coverage judgment: shared
                 // across every branch's value-compat pair walk, so a wide
-                // union cannot multiply a fresh budget per branch.
-                let mut budget = STRICT_PAIR_JUDGE_CALL_BUDGET;
-                obj.get("anyOf")
+                // union cannot multiply a fresh budget per branch. The
+                // budget is per REQUEST PREPARATION, not per node (round
+                // 23): a fresh budget at every composition node let a wide
+                // schema pay branches × 256 pair calls per request —
+                // measured 1.34 s per request for a ~1 MB 3,000-node
+                // document — so each judgment takes what remains of the
+                // preparation's budget and hands the unconsumed remainder
+                // back.
+                let mut budget = pair_budget_take();
+                let coverage = obj
+                    .get("anyOf")
                     .and_then(Value::as_array)
                     .is_some_and(|branches| {
                         !branches.iter().any(|branch| {
@@ -2403,7 +2414,9 @@ fn has_strict_incompatible_composition(schema: &Value, root: &Value, is_root: bo
                                     )
                             })
                         })
-                    })
+                    });
+                pair_budget_give_back(budget);
+                coverage
             })
         {
             return true;
@@ -2540,6 +2553,34 @@ fn has_strict_incompatible_composition(schema: &Value, root: &Value, is_root: bo
         {
             return true;
         }
+        // A `$ref`-pinned node's own bounds bind exactly like a typed
+        // node's when the reference resolves (within the hop budget) to a
+        // numeric schema: the instance IS the definition's value, so
+        // `{"$ref": num, "multipleOf": 0}` — or crossed bounds beside a
+        // numeric definition — admits nothing, the same
+        // no-satisfiable-value class the typed arm judges. The round-22
+        // force-numeric predicate judged only branches of an `anyOf` and
+        // never the ref-pinned node itself, and the single-branch collapse
+        // lands `{"anyOf": [{"$ref": num}], "multipleOf": 0}` as exactly
+        // this shape on the enforced clone, so the laundered form shipped
+        // strict callable by nothing (round 23). A node whose forcing is
+        // unknown past a budget fails closed beside contradicting bounds
+        // for the same reason the composition arm's unknown does; a node
+        // carrying its own `anyOf` is the composition arm's domain (a
+        // branch may admit a non-numeric instance the ref pin cannot
+        // see).
+        if !obj.contains_key("type")
+            && !obj.contains_key("anyOf")
+            && obj.contains_key("$ref")
+            && let Some(definition) = ref_pinned_definition(obj, root)
+            && matches!(
+                numeric_forcing_of_definition(definition, root, 4),
+                NumericForcing::Forces | NumericForcing::Unknown
+            )
+            && numeric_bounds_contradiction(obj)
+        {
+            return true;
+        }
         // An `enum` member must satisfy the declared type AND every
         // documented bound, so a member set none of whose members clears
         // the bounds ships the same no-satisfiable-value shape as the
@@ -2585,13 +2626,27 @@ fn has_strict_incompatible_composition(schema: &Value, root: &Value, is_root: bo
                 // the caps the property patterns compile once per node,
                 // not once per member.
                 if !enum_members_within_judge_cap(members) {
-                    return false;
+                    // Round 23: past the caps the member scan used to
+                    // abstain compatible, and a 300-member enum whose every
+                    // member violates the node's `maximum: 100` (or whose
+                    // strings all miss the node's `pattern`) shipped strict
+                    // callable by nothing. Where the node carries a
+                    // constraint the skipped scan would have judged, the
+                    // honest verdict is fail-closed; a bare oversized enum
+                    // keeps the abstention (it is satisfiable by any of its
+                    // members on its own).
+                    return node_carries_member_constraints(obj);
                 }
                 let node_pattern = compiled_documented_pattern(obj);
                 let property_patterns = compiled_property_patterns(obj);
                 !members.iter().any(|member| {
                     value_clears_bounds_with(member, obj, node_pattern.as_ref())
-                        && pinned_object_value_compatible_with(member, obj, &property_patterns)
+                        && pinned_object_value_compatible_with(
+                            member,
+                            obj,
+                            &property_patterns,
+                            PINNED_OBJECT_JUDGE_DEPTH,
+                        )
                 })
             })
         {
@@ -2652,18 +2707,39 @@ fn has_strict_incompatible_composition(schema: &Value, root: &Value, is_root: bo
             let mut node_sans_any_of = obj.clone();
             node_sans_any_of.remove("anyOf");
             let node_sans_any_of = Value::Object(node_sans_any_of);
-            let mut budget = STRICT_PAIR_JUDGE_CALL_BUDGET;
+            let mut budget = pair_budget_take();
             let witness = branches.iter().any(|branch| {
                 schema_pair_satisfiable(branch, &node_sans_any_of, root, 0, &mut budget)
             });
-            let all_branches_force_numeric = branches
-                .iter()
-                .all(|branch| branch_forces_numeric(branch, root, 4));
+            pair_budget_give_back(budget);
+            // A branch whose forcing is unknown past a budget is not a
+            // "does not force": beside contradicting bounds the honest
+            // verdict is the conservative one (round 23 — the depth budget
+            // used to answer DoesNot and ship a five-level all-numeric
+            // union beside `multipleOf: 0` strict, callable by nothing).
+            // Beside bounds that do NOT contradict the unknown is
+            // harmless and keeps shipping.
+            let mut all_branches_force_numeric = true;
+            let mut branch_forcing_unknown = false;
+            for branch in branches {
+                match branch_forces_numeric_checked(branch, root, 4) {
+                    NumericForcing::Forces => {}
+                    NumericForcing::DoesNot => {
+                        all_branches_force_numeric = false;
+                        break;
+                    }
+                    NumericForcing::Unknown => {
+                        branch_forcing_unknown = true;
+                        break;
+                    }
+                }
+            }
+            let composition_bounds_contradiction = node_sans_any_of
+                .as_object()
+                .is_some_and(numeric_bounds_contradiction);
             if !witness
-                || (all_branches_force_numeric
-                    && node_sans_any_of
-                        .as_object()
-                        .is_some_and(numeric_bounds_contradiction))
+                || (composition_bounds_contradiction
+                    && (all_branches_force_numeric || branch_forcing_unknown))
             {
                 return true;
             }
@@ -2998,16 +3074,38 @@ thread_local! {
     > = std::cell::RefCell::new(std::collections::HashMap::new());
     static PATTERN_COMPILES_THIS_REQUEST: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static PAIR_JUDGE_CALLS_LEFT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
     #[cfg(test)]
     static PATTERN_LEAKED_KEYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Compiles one request preparation may pay before the pattern judge
-/// abstains compatible: 128 heavy compiles at the measured ~1.5 ms worst
-/// legal compile stay ~0.2 s, an order below the seconds the unbounded
-/// rotation cost, while normal catalogs (every pattern cached after the
-/// first pass) never reach the budget at all.
+/// abstains compatible: 128 screened compiles (see the expansion screen in
+/// `compile_documented_pattern` — the screen is what bounds both the
+/// compile cost and the match cost; the pre-screen worst legal compile
+/// measured 11-15 ms, not the ~1.5 ms this comment used to claim, and a
+/// budget-full request paid ~1 s recurring) stay well under the seconds
+/// the unbounded rotation cost, while normal catalogs (every pattern
+/// cached after the first pass) never reach the budget at all.
 const STRICT_PATTERN_COMPILE_BUDGET: usize = 128;
+
+/// The pair judge's remaining call budget for the current request
+/// preparation: taken by each coverage/composition judgment and handed
+/// back after it (round 23 — the budget used to be created fresh per node,
+/// so a wide schema paid nodes × 256 pair calls per request). Reset at
+/// [`prepare_tools_for_strict_mode`] entry beside the compile budget.
+fn pair_budget_take() -> usize {
+    PAIR_JUDGE_CALLS_LEFT.with(|cell| {
+        let left = cell.get();
+        cell.set(0);
+        left
+    })
+}
+
+fn pair_budget_give_back(unconsumed: usize) {
+    PAIR_JUDGE_CALLS_LEFT.with(|cell| cell.set(unconsumed));
+}
 
 /// Test-only observability for the memo's discipline: (compiles paid in
 /// the current request, keys leaked for the table so far on this thread).
@@ -3016,6 +3114,15 @@ fn pattern_compile_counters_for_test() -> (usize, usize) {
     let leaked = PATTERN_LEAKED_KEYS.with(|counter| counter.get());
     let compiles = PATTERN_COMPILES_THIS_REQUEST.with(|counter| counter.get());
     (compiles, leaked)
+}
+
+/// Test-only observability for the shared pair-judge budget: calls left in
+/// the current preparation after the last [`prepare_tools_for_strict_mode`]
+/// entry (the shared-budget pin reads it; a per-node fresh-budget
+/// regression leaves the cell untouched and the pin red).
+#[cfg(test)]
+fn pair_budget_remaining_for_test() -> usize {
+    PAIR_JUDGE_CALLS_LEFT.with(|cell| cell.get())
 }
 
 /// The node's `pattern`, compiled for member judging, or `None` when the
@@ -3083,8 +3190,83 @@ fn compile_documented_pattern(pattern: &str) -> Option<regex::Regex> {
     if pattern.contains("(?i") || pattern.contains("\\b") || pattern.contains("\\B") {
         return None;
     }
-    regex::Regex::new(pattern).ok()
+    // Round 23: a static EXPANSION screen before compiling. The judge's
+    // real cost is member length × NFA-program size, and the NFA's state
+    // count grows with the PRODUCT of nested bounded-repeat upper bounds —
+    // a 143-byte `(a{1,100}){1,100}`-family pattern compiled to a program
+    // whose per-member match cost measured ~340 ms recurring, ~87-99 s per
+    // node within the judge's own caps, immune to the compile budget (the
+    // cost recurs with the compile fully cached) and to the regex crate's
+    // `size_limit`, which bounds the lazy DFA cache but not the NFA the
+    // matcher simulates (probed: the hostile compile still succeeded at a
+    // 256 KiB size limit). The screen multiplies every `{n,m}` upper bound
+    // it can read cheaply from the source; past the bound the judge
+    // abstains — the pattern still ships and binds on the wire, the same
+    // line the ECMA-only spellings draw, and nothing that ships changes.
+    // The scan overestimates for alternation (which adds states rather
+    // than multiplying them) and misreads braces inside classes, so it
+    // moves some fine patterns to the abstain line — the conservative
+    // direction. The screen also runs before `Regex::new`, so the compile
+    // cost itself (11-15 ms measured for the hostile shapes the budget
+    // comment used to price at ~1.5 ms) is bounded for screened-out
+    // sources. With total judged member bytes capped at 4 KB by the
+    // member caps, the per-node match work is bounded by roughly
+    // 4 KB × expansion states.
+    let mut expansion: u64 = 1;
+    let bytes = pattern.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'{' && index + 1 < bytes.len() && bytes[index + 1].is_ascii_digit() {
+            let mut cursor = index + 1;
+            let lower = parse_repeat_bound(bytes, &mut cursor);
+            let upper = if cursor < bytes.len() && bytes[cursor] == b',' {
+                cursor += 1;
+                let high = parse_repeat_bound(bytes, &mut cursor);
+                // `{n,}` repeats n copies plus a star — the NFA size
+                // tracks the lower bound, not infinity.
+                high.or(lower)
+            } else {
+                lower
+            };
+            if cursor < bytes.len() && bytes[cursor] == b'}' && upper.is_some() {
+                expansion = expansion.saturating_mul(upper.unwrap_or(1).max(1));
+                index = cursor;
+            }
+        }
+        if expansion > STRICT_PATTERN_EXPANSION_LIMIT {
+            return None;
+        }
+        index += 1;
+    }
+    regex::RegexBuilder::new(pattern)
+        .size_limit(STRICT_PATTERN_COMPILED_SIZE_LIMIT)
+        .build()
+        .ok()
 }
+
+/// Upper-bound parser for one `{n}`/`{n,m}`/`{n,}` tail, saturating; used
+/// by the expansion screen. `None` when no digit was read at the cursor.
+fn parse_repeat_bound(bytes: &[u8], cursor: &mut usize) -> Option<u64> {
+    let mut value: u64 = 0;
+    let mut saw = false;
+    while *cursor < bytes.len() && bytes[*cursor].is_ascii_digit() {
+        value = value
+            .saturating_mul(10)
+            .saturating_add(u64::from(bytes[*cursor] - b'0'));
+        saw = true;
+        *cursor += 1;
+    }
+    saw.then_some(value)
+}
+
+/// Expansion-screen bound on the product of bounded-repeat upper bounds;
+/// see the compile body for the measurement behind it.
+const STRICT_PATTERN_EXPANSION_LIMIT: u64 = 10_000;
+
+/// Lazy-DFA cache size cap passed to the regex builder; the NFA the
+/// matcher simulates is bounded by the expansion screen above, not by
+/// this.
+const STRICT_PATTERN_COMPILED_SIZE_LIMIT: usize = 256 * 1024;
 
 /// Whether one pinned string value satisfies the node's documented string
 /// constraints: the `pattern` (the caller passes the shared compiled
@@ -3223,6 +3405,15 @@ fn pinned_values_equal_depth(a: &Value, b: &Value, depth: usize) -> bool {
         if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
             return x == y;
         }
+        // Mixed spellings of integral values compare exactly too: the f64
+        // projection collapses distinct integers at and above 2^53, so
+        // `9007199254740992.0` beside `9007199254740993` must not read as
+        // one pin. The round-22 override covered only the
+        // both-integral-stored spellings; the mixed-spelling twins escaped
+        // it through this very fallback (round 23).
+        if let (Some(x), Some(y)) = (bounds_number(a), bounds_number(b)) {
+            return x == y;
+        }
     }
     if let (Some(x), Some(y)) = (a.as_f64(), b.as_f64()) {
         return x == y;
@@ -3339,6 +3530,27 @@ fn branch_property_closure<'a>(
     )
 }
 
+/// Resolve a `$ref`-pinned node to the definition it stands for, map-side:
+/// the sibling of [`resolved_branch_definition`] that starts from the
+/// node's own `$ref` (the gate sees the node as a `&Map`, and cloning it
+/// into a `Value` per call would cost a transient allocation on every
+/// reference-carrying node per request). Same inclusive hop budget, same
+/// pre-failed dangling/malformed/cyclic classes.
+fn ref_pinned_definition<'a>(obj: &'a Map<String, Value>, root: &'a Value) -> Option<&'a Value> {
+    let mut target = resolve_local_ref(root, obj.get("$ref").and_then(Value::as_str)?)?;
+    for _ in 1..=STRICT_REF_MAX_HOPS {
+        let Some(reference) = target
+            .as_object()
+            .and_then(|target_obj| target_obj.get("$ref"))
+            .and_then(Value::as_str)
+        else {
+            break;
+        };
+        target = resolve_local_ref(root, reference)?;
+    }
+    Some(target)
+}
+
 /// Resolve a union branch to the schema it stands for: the branch itself
 /// when it names no reference, or the definition at the end of its
 /// `$ref` chain (hop-capped, the same cap and resolution machinery the
@@ -3347,7 +3559,14 @@ fn branch_property_closure<'a>(
 /// a hop is not an object a `$ref` could live on.
 fn resolved_branch_definition<'a>(branch: &'a Value, root: &'a Value) -> Option<&'a Value> {
     let mut target = branch;
-    for _ in 0..STRICT_REF_MAX_HOPS {
+    // Inclusive bound: the reference walk admits chains whose visited set
+    // holds MAX_HOPS entries plus the start, which is MAX_HOPS + 1 `$ref`
+    // keys — a chain of exactly that length used to strand this predicate
+    // on a still-`$ref` node after MAX_HOPS derefs (the walk kept it, the
+    // deref could not finish it), so a chain the walk admitted escaped the
+    // numeric-forcing judgment its 15-hop twin failed closed on (round 23
+    // hop alignment).
+    for _ in 0..=STRICT_REF_MAX_HOPS {
         let obj = target.as_object()?;
         let Some(reference) = obj.get("$ref").and_then(Value::as_str) else {
             break;
@@ -3435,6 +3654,85 @@ const ENUM_PAIR_MEMBER_BYTES_CAP: usize = 4_096;
 /// [`enum_members_within_judge_cap`] for the size bound beside it).
 const ENUM_PAIR_MEMBER_CAP: usize = 256;
 
+/// Whether a schema node carries any keyword the strict judges actually
+/// judge (a declared type, pins, bounds, pattern/format, items, a
+/// properties map, or a union): the exhaustion guards use it to keep
+/// their conservative verdicts honest. A bound that fires on two nodes
+/// neither of which carries a judged constraint would fail a tool closed
+/// for nothing, so there the abstention stays compatible; where a judged
+/// constraint is present the skipped judgment could have proven the pair
+/// unsatisfiable, and the honest verdict is the tool-level fail-closed
+/// (round 23).
+fn carries_judged_constraints(schema: &Value) -> bool {
+    schema.as_object().is_some_and(|obj| {
+        obj.keys().any(|key| {
+            matches!(
+                key.as_str(),
+                "type"
+                    | "enum"
+                    | "const"
+                    | "minimum"
+                    | "maximum"
+                    | "exclusiveMinimum"
+                    | "exclusiveMaximum"
+                    | "multipleOf"
+                    | "pattern"
+                    | "format"
+                    | "items"
+                    | "properties"
+                    | "anyOf"
+            )
+        })
+    })
+}
+
+/// The non-enum subset of [`carries_judged_constraints`]: what remains to
+/// contradict a pair when the enum membership scans are skipped past the
+/// caps. (`enum` is the skipped judgment's own input, not an independent
+/// constraint here.)
+fn carries_non_enum_judged_constraints(obj: &Map<String, Value>) -> bool {
+    obj.keys().any(|key| {
+        matches!(
+            key.as_str(),
+            "type"
+                | "const"
+                | "minimum"
+                | "maximum"
+                | "exclusiveMinimum"
+                | "exclusiveMaximum"
+                | "multipleOf"
+                | "pattern"
+                | "format"
+                | "items"
+                | "properties"
+        )
+    })
+}
+
+/// Whether a node carries a constraint its pinned members would have to
+/// clear — the condition under which a member scan skipped past the
+/// enum caps could have proven the node unsatisfiable, so the honest
+/// verdict is fail-closed instead of the old compatible abstention
+/// (round 23). `const` is absent: a const beside an enum is landed or
+/// yielded by the strip pass before the gate runs.
+fn node_carries_member_constraints(obj: &Map<String, Value>) -> bool {
+    obj.keys().any(|key| {
+        matches!(
+            key.as_str(),
+            "type"
+                | "minimum"
+                | "maximum"
+                | "exclusiveMinimum"
+                | "exclusiveMaximum"
+                | "multipleOf"
+                | "pattern"
+                | "format"
+                | "items"
+                | "properties"
+        )
+    })
+}
+
 /// Whether one pinned object VALUE (an `enum` member or a `const`) can
 /// satisfy the other side's enforced object shape: its keys must sit
 /// inside the other side's property set (`additionalProperties: false`),
@@ -3449,7 +3747,12 @@ const ENUM_PAIR_MEMBER_CAP: usize = 256;
 /// sees it.
 fn pinned_object_value_compatible(member: &Value, other: &Map<String, Value>) -> bool {
     let property_patterns = compiled_property_patterns(other);
-    pinned_object_value_compatible_with(member, other, &property_patterns)
+    pinned_object_value_compatible_with(
+        member,
+        other,
+        &property_patterns,
+        PINNED_OBJECT_JUDGE_DEPTH,
+    )
 }
 
 /// The compiled `pattern` judge for every property schema of one side,
@@ -3479,10 +3782,17 @@ fn compiled_property_patterns(
         .unwrap_or_default()
 }
 
+/// Recursion bound for the pinned-object judgment, mirroring the
+/// pinned-value equality's depth cap: a real schema's pin is a handful of
+/// levels deep, and the bound keeps a hostile self-nesting pin from
+/// walking its own shape unbounded.
+const PINNED_OBJECT_JUDGE_DEPTH: usize = 8;
+
 fn pinned_object_value_compatible_with(
     member: &Value,
     other: &Map<String, Value>,
     property_patterns: &std::collections::BTreeMap<String, Option<regex::Regex>>,
+    depth: usize,
 ) -> bool {
     let Some(member_obj) = member.as_object() else {
         return true;
@@ -3512,9 +3822,7 @@ fn pinned_object_value_compatible_with(
                 // `{"a": "x"}` admits no instance, and only the leaf
                 // comparison sees it. Past the membership caps the pin
                 // judgment abstains compatible — the same hostile-input
-                // line the enum arms draw. (Nested instance recursion — a
-                // pin whose members are themselves objects judged against
-                // deeper property schemas — stays the disclosed line.)
+                // line the enum arms draw.
                 if let Some(const_value) = property_schema.get("const")
                     && !pinned_values_equal(member_value, const_value)
                 {
@@ -3527,6 +3835,37 @@ fn pinned_object_value_compatible_with(
                         .any(|candidate| pinned_values_equal(candidate, member_value))
                 {
                     return false;
+                }
+                // Round 23: the carried value is itself an object and the
+                // property schema constrains that object's members —
+                // recurse instead of judging the pin by the property's
+                // scalar constraints alone. The single-level scan let a
+                // three-level pin (`enum: [{"a": {"b": {"c": "x"}}}]`)
+                // pass a property chain that pins `c` to a number: every
+                // level's judgments saw only the level above it, and the
+                // union shipped strict callable by nothing. The recursion
+                // inherits the arms above at every level (keys inside the
+                // nested property set, nested required names covered), so
+                // an incompatible level fails exactly as it does one level
+                // up; past the depth cap the conservative verdict is
+                // incompatible, because a deeper pin's compatibility
+                // cannot be proven.
+                if member_value.as_object().is_some()
+                    && property_schema
+                        .get("properties")
+                        .and_then(Value::as_object)
+                        .is_some()
+                {
+                    if depth == 0 {
+                        return false;
+                    }
+                    let nested_patterns = compiled_property_patterns(property_schema);
+                    return pinned_object_value_compatible_with(
+                        member_value,
+                        property_schema,
+                        &nested_patterns,
+                        depth - 1,
+                    );
                 }
                 // The map was built from this same `other` side's property
                 // schemas, and the arm above already checked the schema is an
@@ -3573,12 +3912,18 @@ fn schema_pair_satisfiable(
 ) -> bool {
     // Cycle bounds: see the doc comment. Both sit far above anything a
     // non-cyclic document reaches, so the only shapes they turn away are
-    // hostile cycles.
-    if depth > STRICT_PAIR_JUDGE_MAX_DEPTH {
-        return true;
-    }
-    if *budget == 0 {
-        return true;
+    // hostile cycles. Exhaustion used to abstain compatible-by-default —
+    // but the budgets burn out exactly when no branch or member survives,
+    // so the abstention landed precisely on the unsatisfiable case: a
+    // 300-branch union of per-branch `const: 1` beside a `const: 2` node
+    // shipped strict callable by nothing at the cap, and the coverage arm
+    // counted an exhausted pair as covering. The honest verdict is
+    // tool-level fail-closed when either side carries a judged constraint
+    // the skipped judgment would have consulted; beside two
+    // constraint-free nodes nothing could have been proven either way and
+    // the abstention stays compatible (round 23).
+    if depth > STRICT_PAIR_JUDGE_MAX_DEPTH || *budget == 0 {
+        return !(carries_judged_constraints(a) || carries_judged_constraints(b));
     }
     *budget -= 1;
     // By the time the gate runs, the reference walk has already failed
@@ -3622,7 +3967,14 @@ fn schema_pair_satisfiable(
             continue;
         };
         if alternatives.len() > ANYOF_PAIR_ALTERNATIVE_CAP {
-            return true;
+            // Round 23: past the alternative cap the chase used to abstain
+            // compatible, and a 300-branch union whose every branch pins
+            // `const: 1` beside a `const: 2` sibling burned the cap and
+            // shipped strict callable by nothing. The chase cannot prove
+            // the pair satisfiable past the cap, and the wrapper carries
+            // `anyOf` — itself a judged constraint — so the honest
+            // verdict is fail-closed.
+            return false;
         }
         // The sibling is the wrapper with `anyOf` removed; a bare wrapper has
         // none. The witness must be judged JOINTLY: the instance satisfies
@@ -3714,6 +4066,16 @@ fn schema_pair_satisfiable(
             .and_then(Value::as_array)
             .is_none_or(|members| enum_members_within_judge_cap(members))
     });
+    // When one side's enum overshoots the membership caps the scans below
+    // skip it; they used to abstain compatible, and a 300-member enum
+    // whose every member violates the other side's `maximum: 100` shipped
+    // strict callable by nothing (round 23). Where a judged constraint
+    // beyond the enums themselves is present the skipped scan could have
+    // proven the pair unsatisfiable, so the honest verdict is
+    // fail-closed; two constraint-free-but-oversized enums keep the
+    // abstention (nothing else could contradict).
+    let pair_has_non_enum_constraints =
+        carries_non_enum_judged_constraints(a_obj) || carries_non_enum_judged_constraints(b_obj);
     // One compile per side (not per direction per judgment): every
     // pinned value below is judged against the opposing side's shared
     // compiled form, and a hostile pattern pays at most two compiles
@@ -3732,13 +4094,21 @@ fn schema_pair_satisfiable(
             {
                 return false;
             }
-            if let Some(other_members) = other.get("enum").and_then(Value::as_array)
-                && enum_pair_chaseable
-                && !other_members
-                    .iter()
-                    .any(|member| pinned_values_equal(member, const_value))
-            {
-                return false;
+            if let Some(other_members) = other.get("enum").and_then(Value::as_array) {
+                if enum_pair_chaseable {
+                    if !other_members
+                        .iter()
+                        .any(|member| pinned_values_equal(member, const_value))
+                    {
+                        return false;
+                    }
+                } else if pair_has_non_enum_constraints {
+                    // Round 23: the membership scan past the caps used to
+                    // abstain compatible; beside a judged constraint the
+                    // skipped scan could have proven the const outside the
+                    // enum, and the honest verdict is fail-closed.
+                    return false;
+                }
             }
             if !value_clears_bounds_with(const_value, other, other_pattern) {
                 return false;
@@ -3761,6 +4131,20 @@ fn schema_pair_satisfiable(
             {
                 return false;
             }
+            // Round 23: past the caps the membership and value scans below
+            // skip the oversized side, and the abstention landed exactly on
+            // the unsatisfiable case (a 300-member enum violating the other
+            // side's `maximum`). When a judged non-enum constraint is in
+            // play AND the pinned-side value scan cannot run either, the
+            // honest verdict is fail-closed; a runnable value scan still
+            // gets to prove compatibility first. Two oversized enum-only
+            // sides keep the abstention.
+            if !enum_pair_chaseable
+                && pair_has_non_enum_constraints
+                && !enum_members_within_judge_cap(members)
+            {
+                return false;
+            }
             if enum_members_within_judge_cap(members) {
                 // The property patterns compile once per pair call, not
                 // once per member × per key — the same hoist the node-level
@@ -3768,7 +4152,12 @@ fn schema_pair_satisfiable(
                 let property_patterns = compiled_property_patterns(other);
                 if !members.iter().any(|member| {
                     value_clears_bounds_with(member, other, other_pattern)
-                        && pinned_object_value_compatible_with(member, other, &property_patterns)
+                        && pinned_object_value_compatible_with(
+                            member,
+                            other,
+                            &property_patterns,
+                            PINNED_OBJECT_JUDGE_DEPTH,
+                        )
                 }) {
                     return false;
                 }
@@ -3834,60 +4223,159 @@ fn declared_types_disjoint(a: &str, b: &str) -> bool {
 /// hold a value outside the bounds' domain — the direct-type-only check let
 /// an `enum:[1,2]` branch beside `multipleOf: 0` (or crossed bounds) ship a
 /// union no instance satisfies.
-fn branch_forces_numeric(branch: &Value, root: &Value, depth: usize) -> bool {
+/// Whether a schema node admits only numeric instances. Tri-state since
+/// round 23: `Unknown` marks a judgment the hop or depth budget exhausted
+/// — a still-`$ref` node after the deref budget, a nested-union chain
+/// past the depth budget — where the old binary predicate answered "does
+/// not force", and that answer IS a verdict: the composition arm skipped
+/// its crossing judgment and shipped a union of all-numeric leaves beside
+/// `multipleOf: 0` strict, callable by nothing (probed at five def levels).
+/// `Unknown` lets the caller fail closed beside contradicting bounds —
+/// and only there, so satisfiable deep unions keep shipping.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NumericForcing {
+    Forces,
+    DoesNot,
+    Unknown,
+}
+
+/// Whether one `anyOf` branch admits only numeric instances: a direct
+/// `number`/`integer` `type`, a numeric `const` pin, an `enum` whose every
+/// member is numeric, a `$ref` resolved (within the hop budget) to any of
+/// those, or a nested `anyOf` whose every branch forces numeric. The
+/// typeless-composition arm keys its within-node crossing/zero-multiple
+/// judgment on this predicate, and a branch that forces numeric through a
+/// member pin rather than a declared `type` string is exactly as unable to
+/// hold a value outside the bounds' domain — the direct-type-only check let
+/// an `enum:[1,2]` branch beside `multipleOf: 0` (or crossed bounds) ship a
+/// union no instance satisfies.
+fn branch_forces_numeric_checked(branch: &Value, root: &Value, depth: usize) -> NumericForcing {
     let Some(definition) = resolved_branch_definition(branch, root) else {
-        return false;
+        return NumericForcing::Unknown;
     };
+    numeric_forcing_of_definition(definition, root, depth)
+}
+
+/// The definition-side body of [`branch_forces_numeric_checked`]: shared
+/// with the `$ref`-pinned node arm, which resolves the node's own
+/// reference through the map-side helper (cloning the node per gate call
+/// to reuse the branch-side entry would cost a transient allocation on
+/// every reference-carrying node per request).
+fn numeric_forcing_of_definition(definition: &Value, root: &Value, depth: usize) -> NumericForcing {
     let Some(definition_obj) = definition.as_object() else {
-        return false;
+        return NumericForcing::DoesNot;
     };
     if let Some(schema_type) = definition_obj.get("type").and_then(Value::as_str) {
-        return matches!(schema_type, "number" | "integer");
+        return if matches!(schema_type, "number" | "integer") {
+            NumericForcing::Forces
+        } else {
+            NumericForcing::DoesNot
+        };
     }
     if let Some(const_value) = definition_obj.get("const") {
-        return const_value.is_number();
+        return if const_value.is_number() {
+            NumericForcing::Forces
+        } else {
+            NumericForcing::DoesNot
+        };
     }
     if let Some(members) = definition_obj.get("enum").and_then(Value::as_array) {
-        return !members.is_empty() && members.iter().all(Value::is_number);
+        return if !members.is_empty() && members.iter().all(Value::is_number) {
+            NumericForcing::Forces
+        } else {
+            NumericForcing::DoesNot
+        };
     }
-    if depth > 0
-        && let Some(nested) = definition_obj.get("anyOf").and_then(Value::as_array)
-    {
-        return !nested.is_empty()
-            && nested
-                .iter()
-                .all(|branch| branch_forces_numeric(branch, root, depth - 1));
+    if definition_obj.contains_key("$ref") {
+        // Still a reference after the inclusive hop budget: the definition
+        // the instance must satisfy was not reached, so its forcing is
+        // unknown rather than absent.
+        return NumericForcing::Unknown;
     }
-    false
+    if definition_obj.contains_key("anyOf") {
+        // At depth 0 the nested union cannot be traversed — the budget is
+        // exhausted, and the old shape silently answered DoesNot here,
+        // which let a five-level all-numeric union beside
+        // `multipleOf: 0` ship strict callable by nothing (round 23).
+        if depth == 0 {
+            return NumericForcing::Unknown;
+        }
+        if let Some(nested) = definition_obj.get("anyOf").and_then(Value::as_array)
+            && !nested.is_empty()
+        {
+            for branch in nested {
+                match branch_forces_numeric_checked(branch, root, depth - 1) {
+                    NumericForcing::Forces => {}
+                    NumericForcing::DoesNot => return NumericForcing::DoesNot,
+                    NumericForcing::Unknown => return NumericForcing::Unknown,
+                }
+            }
+            return NumericForcing::Forces;
+        }
+    }
+    NumericForcing::DoesNot
 }
 
 /// An integer-typed JSON number as exact i128: u64 and i64 both fit, and
 /// the f64 projection loses precision above 2^53 — where a crossing like
 /// `minimum: 9223372036854775807` beside `maximum: 9223372036854775806`
-/// compares equal and slips a no-satisfiable-value node through.
+/// compares equal and slips a no-satisfiable-value node through. A
+/// float-spelled integral value (`9007199254740992.0`) normalizes to the
+/// same exact integer: serde only falls to f64 storage when the source
+/// carried a decimal point, and the stored f64 IS that exact integer, so
+/// the mixed-spelling pairs the both-integral check missed (`enum:
+/// [9007199254740992.0]` beside `const: 9007199254740993`, a bound spelled
+/// `9007199254740992.0` beside an integer pin one above it) compare
+/// exactly too (round 23). Genuinely fractional values stay `None` and
+/// keep the f64 comparison, which is exact below 2^53 where they live.
 fn bounds_number(value: &Value) -> Option<i128> {
     value
         .as_i64()
         .map(i128::from)
         .or_else(|| value.as_u64().map(i128::from))
+        .or_else(|| {
+            let float = value.as_f64()?;
+            (float.is_finite() && float.fract() == 0.0).then_some(float as i128)
+        })
 }
 
 fn numeric_bounds_contradiction(obj: &Map<String, Value>) -> bool {
-    let minimum = obj.get("minimum").and_then(Value::as_f64);
-    let exclusive_minimum = obj.get("exclusiveMinimum").and_then(Value::as_f64);
-    let maximum = obj.get("maximum").and_then(Value::as_f64);
-    let exclusive_maximum = obj.get("exclusiveMaximum").and_then(Value::as_f64);
-    let crossed = match (minimum, exclusive_minimum, maximum, exclusive_maximum) {
-        (Some(min), _, Some(max), _) if min > max => true,
-        (Some(min), _, _, Some(max)) if min >= max => true,
-        (_, Some(excl_min), Some(max), _) if excl_min >= max => true,
-        (_, Some(excl_min), _, Some(excl_max)) if excl_min >= excl_max => true,
-        _ => false,
-    };
-    // Exact-integer override: when both bounds of a pair are integer-typed,
-    // their crossing is decided exactly even where the f64 projection
-    // rounds both bounds onto one value.
-    let pairs = [
+    // Each opposing pair crosses when the stricter comparison says so.
+    // Round 23: the comparison is EXACT-FIRST — when both bounds of a pair
+    // carry exact integers (either storage spelling; `bounds_number`
+    // normalizes float-spelled integral values too) the i128 values
+    // decide, and the f64 projection only fills pairs with a genuinely
+    // fractional bound. The old shape computed the crossing from the f64
+    // projections FIRST and used the exact path only as an additional
+    // override: at u64 edges the projection rounds the two bounds onto
+    // one value (`exclusiveMinimum: 2^60 - 1` projects onto
+    // `maximum: 2^60`), so the f64 arm fired `excl_min >= max` on a live
+    // window and the exact path — which reads it uncrossed — never got to
+    // speak (a satisfiable dual-spelling union failed closed). The f64
+    // fallback stays monotonicity-safe for the exact spellings it still
+    // sees (x < y implies f64(x) <= f64(y), so a projected crossing is a
+    // true crossing).
+    let pair_crosses =
+        |lower: Option<&Value>, upper: Option<&Value>, equal_crosses: bool| -> bool {
+            match (lower.and_then(bounds_number), upper.and_then(bounds_number)) {
+                (Some(lv), Some(uv)) => {
+                    if equal_crosses {
+                        lv >= uv
+                    } else {
+                        lv > uv
+                    }
+                }
+                _ => {
+                    let (Some(lv), Some(uv)) =
+                        (lower.and_then(Value::as_f64), upper.and_then(Value::as_f64))
+                    else {
+                        return false;
+                    };
+                    if equal_crosses { lv >= uv } else { lv > uv }
+                }
+            }
+        };
+    let crossed = [
         (obj.get("minimum"), obj.get("maximum"), false),
         (obj.get("minimum"), obj.get("exclusiveMaximum"), true),
         (obj.get("exclusiveMinimum"), obj.get("maximum"), true),
@@ -3896,24 +4384,14 @@ fn numeric_bounds_contradiction(obj: &Map<String, Value>) -> bool {
             obj.get("exclusiveMaximum"),
             true,
         ),
-    ];
-    let exact_crossed = pairs.iter().any(|(lower, upper, equal_crosses)| {
-        match (lower.and_then(bounds_number), upper.and_then(bounds_number)) {
-            (Some(lv), Some(uv)) => {
-                if *equal_crosses {
-                    lv >= uv
-                } else {
-                    lv > uv
-                }
-            }
-            _ => false,
-        }
-    });
+    ]
+    .into_iter()
+    .any(|(lower, upper, equal_crosses)| pair_crosses(lower, upper, equal_crosses));
     let zero_multiple = obj
         .get("multipleOf")
         .and_then(Value::as_f64)
         .is_some_and(|multiple| multiple == 0.0);
-    crossed || exact_crossed || zero_multiple
+    crossed || zero_multiple
 }
 
 fn numeric_windows_cross(a: &Map<String, Value>, b: &Map<String, Value>) -> bool {
@@ -3924,31 +4402,100 @@ fn numeric_windows_cross(a: &Map<String, Value>, b: &Map<String, Value>) -> bool
     // window (`minimum: 0` beside `exclusiveMinimum: 10`) slip a crossing
     // union through on the weaker edge. At a tie the exclusive spelling is
     // the stricter one: the value must clear it, not merely reach it.
+    //
+    // Round 23: the edges carry their exact integral values alongside the
+    // f64 projection. The pure projection rounds distinct integers at and
+    // above 2^53 onto one value (ULP 256 at 2^60), which let an empty
+    // window read satisfiable ACROSS pair sides — `minimum: 2^60` against
+    // a branch's `maximum: 2^60 - 1` shipped strict callable by nothing —
+    // and misread a satisfiable dual-spelling edge as exclusive. When both
+    // edges carry exact values they decide exactly; when a projected tie
+    // leaves an exact spelling unresolved on either side the verdict is
+    // the conservative one (crossed), because at magnitudes where the
+    // projection cannot distinguish two integers the satisfiable reading
+    // cannot be proven. (At such magnitudes every integral-valued f64
+    // normalizes through `bounds_number` anyway, so the residual ambiguity
+    // needs a genuinely fractional edge — where the f64 comparison is
+    // exact.)
+    #[derive(Clone, Copy)]
+    struct WindowEdge {
+        exact: Option<i128>,
+        projected: f64,
+        inclusive: bool,
+    }
     let edge = |obj: &Map<String, Value>,
                 inclusive_key: &str,
                 exclusive_key: &str,
+                stricter_exact: fn(i128, i128) -> i128,
                 stricter: fn(f64, f64) -> f64|
-     -> Option<(f64, bool)> {
+     -> Option<WindowEdge> {
+        let inclusive_exact = obj.get(inclusive_key).and_then(bounds_number);
+        let exclusive_exact = obj.get(exclusive_key).and_then(bounds_number);
         let inclusive = obj.get(inclusive_key).and_then(Value::as_f64);
         let exclusive = obj.get(exclusive_key).and_then(Value::as_f64);
         match (inclusive, exclusive) {
             (Some(inclusive_value), Some(exclusive_value)) => {
-                let value = stricter(inclusive_value, exclusive_value);
-                let from_inclusive = value == inclusive_value && inclusive_value != exclusive_value;
-                Some((value, from_inclusive))
+                match (inclusive_exact, exclusive_exact) {
+                    (Some(inclusive_int), Some(exclusive_int)) => {
+                        let exact = stricter_exact(inclusive_int, exclusive_int);
+                        // Both spellings carry exact integers, so the tie
+                        // rule reads from the exact comparison: the f64
+                        // projection can tie spellings whose true values
+                        // differ by less than one ulp and pick the weaker
+                        // one's inclusivity.
+                        let from_inclusive =
+                            exact == inclusive_int && inclusive_int != exclusive_int;
+                        Some(WindowEdge {
+                            exact: Some(exact),
+                            projected: stricter(inclusive_value, exclusive_value),
+                            inclusive: from_inclusive,
+                        })
+                    }
+                    _ => {
+                        let projected = stricter(inclusive_value, exclusive_value);
+                        let from_inclusive =
+                            projected == inclusive_value && inclusive_value != exclusive_value;
+                        Some(WindowEdge {
+                            exact: None,
+                            projected,
+                            inclusive: from_inclusive,
+                        })
+                    }
+                }
             }
-            (Some(inclusive_value), None) => Some((inclusive_value, true)),
-            (None, Some(exclusive_value)) => Some((exclusive_value, false)),
+            (Some(inclusive_value), None) => Some(WindowEdge {
+                exact: inclusive_exact,
+                projected: inclusive_value,
+                inclusive: true,
+            }),
+            (None, Some(exclusive_value)) => Some(WindowEdge {
+                exact: exclusive_exact,
+                projected: exclusive_value,
+                inclusive: false,
+            }),
             (None, None) => None,
         }
     };
-    let (Some((a_lower, a_lower_inclusive)), Some((b_upper, b_upper_inclusive))) = (
-        edge(a, "minimum", "exclusiveMinimum", f64::max),
-        edge(b, "maximum", "exclusiveMaximum", f64::min),
+    let (Some(a_lower), Some(b_upper)) = (
+        edge(a, "minimum", "exclusiveMinimum", i128::max, f64::max),
+        edge(b, "maximum", "exclusiveMaximum", i128::min, f64::min),
     ) else {
         return false;
     };
-    a_lower > b_upper || (a_lower == b_upper && !(a_lower_inclusive && b_upper_inclusive))
+    if let (Some(lower), Some(upper)) = (a_lower.exact, b_upper.exact) {
+        return lower > upper || (lower == upper && !(a_lower.inclusive && b_upper.inclusive));
+    }
+    let projected_crosses = a_lower.projected > b_upper.projected
+        || (a_lower.projected == b_upper.projected && !(a_lower.inclusive && b_upper.inclusive));
+    if projected_crosses {
+        return true;
+    }
+    // A projected tie beside an exact spelling on either side is the
+    // rounding collapse the exact path exists for: the two true edges may
+    // differ by less than one ulp and cross. Both edges projected and tied
+    // is a genuine equality — no exact spelling is in play — and stays
+    // uncrossed.
+    a_lower.projected == b_upper.projected && (a_lower.exact.is_some() || b_upper.exact.is_some())
 }
 
 /// Whether an `anyOf` branch is a schema the strict documents describe: a
@@ -4776,6 +5323,16 @@ fn merge_root_composition_properties(obj: &mut Map<String, Value>) {
 }
 
 fn root_composition_constraint_note(obj: &Map<String, Value>) -> Option<String> {
+    // Aggregate the required-group note for EVERY root composition keyword,
+    // in the recorded keyword order: this pass strips all three keywords
+    // but a first-match note left the model ignorant of every dropped
+    // constraint after the first (review 5898539144 — a root stacking
+    // `oneOf` and `anyOf` advertised only the exactly-one contract on the
+    // wire). The round-22 rebase reconstruction had regressed to the
+    // fork-chain's first-match shape and dropped the single-group
+    // disclosure with it; round 23 restores the base behavior under the
+    // selection/cap hardening below.
+    let mut notes: Vec<String> = Vec::new();
     for (key, prefix) in [
         ("oneOf", "Exactly one"),
         ("anyOf", "At least one"),
@@ -4794,7 +5351,11 @@ fn root_composition_constraint_note(obj: &Map<String, Value>) -> Option<String> 
             items.iter().filter_map(required_group_names).collect();
         groups.sort_by(|a, b| a.0.cmp(&b.0));
         groups.dedup_by(|a, b| a.0 == b.0);
-        if groups.len() >= 2 {
+        // Every dropped group must be disclosed, including a single one:
+        // with one distinct label the flatten still relaxed the original
+        // constraint (e.g. only one of two branches required it), and
+        // suppressing the note there used to hide the loosening entirely.
+        if !groups.is_empty() {
             // The per-group labels are name- and width-capped; the group
             // count gets its own cap with a counted remainder, so a
             // hostile schema with thousands of branches renders a bounded
@@ -4811,14 +5372,24 @@ fn root_composition_constraint_note(obj: &Map<String, Value>) -> Option<String> 
                 let remainder = total - STRICT_NOTE_MAX_GROUPS;
                 list.push_str(&format!(" ... (+{remainder} more groups)"));
             }
+            // A union alternative that admits the empty instance keeps
+            // omission legal on the flattened wire schema, so a "must"
+            // hint would walk the model onto a path the schema does not
+            // require (review 4604994801). allOf keeps the strong
+            // wording — every branch constrains the same instance, so
+            // each surviving group genuinely is required.
             let optional = key != "allOf" && items.iter().any(alternative_admits_omission);
             let verb = if optional { "may be" } else { "must be" };
-            return Some(format!(
+            notes.push(format!(
                 "{prefix} of these parameter groups {verb} provided: {list}."
             ));
         }
     }
-    None
+    if notes.is_empty() {
+        None
+    } else {
+        Some(notes.join(" "))
+    }
 }
 
 /// The `required` names of one root-composition branch as a raw
@@ -5223,6 +5794,550 @@ fn validate_mfjs_enum(
     }
     Ok(())
 }
+/// Round-23 fix-wave pins: each rule the wave added turns at least one pin
+/// here red when neutered (mutation-verified before the wave was trusted).
+#[cfg(test)]
+mod strict_fixwave_r23 {
+    use super::*;
+    use serde_json::json;
+
+    fn probe_tool(name: &str, input_schema: Value) -> Tool {
+        Tool {
+            tool_type: None,
+            name: name.to_string(),
+            description: name.to_string(),
+            input_schema,
+            allowed_callers: None,
+            defer_loading: None,
+            input_examples: None,
+            strict: None,
+            cache_control: None,
+        }
+    }
+
+    fn verdict(schema: Value) -> (bool, Option<bool>) {
+        let mut tools = vec![probe_tool("probe", schema)];
+        let all = prepare_tools_for_strict_mode(&mut tools);
+        (all, tools[0].strict)
+    }
+
+    fn verdict_bytes(schema: Value) -> (bool, Option<bool>, Value) {
+        let mut tools = vec![probe_tool("probe", schema)];
+        let all = prepare_tools_for_strict_mode(&mut tools);
+        (all, tools[0].strict, tools[0].input_schema.clone())
+    }
+
+    // --- M1: a `$ref`-pinned node's own bounds bind when the definition
+    // --- forces numeric (the round-22 predicate judged only anyOf
+    // --- branches; the single-branch collapse launders the wrapper into
+    // --- exactly this ref-pinned shape).
+
+    #[test]
+    fn ref_pinned_node_beside_a_zero_multiple_fails_closed() {
+        let (all, strict) = verdict(json!({
+            "type": "object",
+            "properties": {
+                "u": {"$ref": "#/$defs/num", "multipleOf": 0}
+            },
+            "required": ["u"],
+            "$defs": {"num": {"type": "number"}}
+        }));
+        assert!(!all);
+        assert_eq!(
+            strict, None,
+            "no number is a multiple of zero: the \
+            ref-pinned node is callable by nothing"
+        );
+    }
+
+    #[test]
+    fn ref_pinned_node_beside_crossed_bounds_fails_closed() {
+        let (all, strict) = verdict(json!({
+            "type": "object",
+            "properties": {
+                "u": {"$ref": "#/$defs/num", "minimum": 10, "maximum": 5}
+            },
+            "required": ["u"],
+            "$defs": {"num": {"type": "number"}}
+        }));
+        assert!(!all);
+        assert_eq!(strict, None);
+    }
+
+    #[test]
+    fn laundered_single_branch_ref_union_fails_closed() {
+        // `{"anyOf":[{"$ref":num}],"multipleOf":0}` collapses to the
+        // ref-pinned shape on the enforced clone — the natural route the
+        // hole was reachable through.
+        let (all, strict) = verdict(json!({
+            "type": "object",
+            "properties": {
+                "u": {"anyOf": [{"$ref": "#/$defs/num"}], "multipleOf": 0}
+            },
+            "required": ["u"],
+            "$defs": {"num": {"type": "number"}}
+        }));
+        assert!(!all);
+        assert_eq!(strict, None);
+    }
+
+    #[test]
+    fn ref_pinned_satisfiable_node_keeps_shipping() {
+        // Guard against overclosure: the ref pin alone (no contradicting
+        // bounds) ships strict.
+        let (all, strict) = verdict(json!({
+            "type": "object",
+            "properties": {
+                "u": {"$ref": "#/$defs/num", "minimum": 0}
+            },
+            "required": ["u"],
+            "$defs": {"num": {"type": "number"}}
+        }));
+        assert!(all);
+        assert_eq!(strict, Some(true));
+    }
+
+    // --- M2: the pair-level windows judge reads exact integral edges
+    // --- (the round-22 exact fix landed only in the per-node bounds
+    // --- contradiction helper).
+
+    #[test]
+    fn cross_side_bigint_window_crossing_fails_closed() {
+        // f64(2^60-1) rounds onto f64(2^60) (ULP 256 at 2^60): the pure
+        // projection read the empty window satisfiable across the pair and
+        // shipped strict requiring x >= 2^60 AND x <= 2^60 - 1.
+        let (all, strict) = verdict(json!({
+            "type": "object",
+            "properties": {"u": {
+                "properties": {"x": {"type": "integer", "minimum": 1152921504606846976i64}},
+                "required": ["x"],
+                "anyOf": [{
+                    "properties": {"x": {"type": "integer", "maximum": 1152921504606846975i64}},
+                    "required": ["x"]
+                }]
+            }},
+            "required": ["u"]
+        }));
+        assert!(!all);
+        assert_eq!(strict, None);
+    }
+
+    #[test]
+    fn dual_spelling_satisfiable_window_keeps_shipping() {
+        // The mirror overclosure the exact edges must not introduce: a
+        // node whose dual lower-edge spellings pin `minimum: 2^60` beside
+        // `exclusiveMinimum: 2^60 - 1` has a live window (the inclusive
+        // spelling is the stricter edge), and the union satisfiable at
+        // exactly 2^60 keeps shipping. The pure-projection edge read both
+        // spellings as one value and picked the exclusive one at the tie,
+        // misreading the window as empty.
+        let (all, strict) = verdict(json!({
+            "type": "object",
+            "properties": {"u": {
+                "type": "integer",
+                "minimum": 1152921504606846976i64,
+                "exclusiveMinimum": 1152921504606846975i64,
+                "anyOf": [{"type": "integer", "maximum": 1152921504606846976i64}]
+            }},
+            "required": ["u"]
+        }));
+        assert!(all, "the window admits exactly 2^60");
+        assert_eq!(strict, Some(true));
+    }
+
+    // --- M3: mixed integer/float spellings compare exactly above 2^53
+    // --- (the round-22 override covered only both-integral-stored
+    // --- spellings).
+
+    #[test]
+    fn mixed_spelling_const_disjoint_from_enum_yields() {
+        // serde stores `9007199254740992.0` as f64 and
+        // `9007199254740993` as u64; the f64 fallback read them as one
+        // pin and shipped BOTH verbatim (const not in the enum = callable
+        // by nothing). The exact comparison reads them disjoint, and the
+        // disjoint const yields to the enum (the disclosed widening).
+        let (all, strict, shipped) = verdict_bytes(json!({
+            "type": "object",
+            "properties": {
+                "u": {"type": "integer", "enum": [9007199254740992.0], "const": 9007199254740993u64}
+            },
+            "required": ["u"]
+        }));
+        assert_eq!(strict, Some(true), "the enum alone is satisfiable");
+        assert!(all);
+        assert!(
+            shipped["properties"]["u"].get("const").is_none(),
+            "the disjoint const yields to the enum instead of shipping an \
+             impossible pair: {}",
+            shipped
+        );
+    }
+
+    #[test]
+    fn mixed_spelling_bound_violated_by_only_member_fails_closed() {
+        // `maximum: 9007199254740992.0` (float-spelled) beside an enum
+        // whose only member is 9007199254740993: the f64 projection read
+        // the member as clearing the bound.
+        let (all, strict) = verdict(json!({
+            "type": "object",
+            "properties": {
+                "u": {"type": "integer", "maximum": 9007199254740992.0, "enum": [9007199254740993u64]}
+            },
+            "required": ["u"]
+        }));
+        assert!(!all);
+        assert_eq!(strict, None);
+    }
+
+    // --- M4: budget/depth exhaustion fails closed where a judged
+    // --- constraint is present (the budgets burn out exactly when no
+    // --- branch or member survives).
+
+    #[test]
+    fn depth5_nested_numeric_union_beside_zero_multiple_fails_closed() {
+        // The composition predicate's depth budget used to answer "does
+        // not force" at exhaustion and ship the union strict.
+        let mut defs = serde_json::Map::new();
+        for level in 0..5 {
+            let inner: Value = if level == 4 {
+                json!({"anyOf": [{"type": "number"}, {"enum": [99]}]})
+            } else {
+                json!({
+                    "anyOf": [
+                        {"$ref": format!("#/$defs/d{}", level + 1)},
+                        {"$ref": format!("#/$defs/m{}", level)}
+                    ]
+                })
+            };
+            defs.insert(format!("d{level}"), inner);
+            defs.insert(format!("m{level}"), json!({"enum": [level + 3]}));
+        }
+        let (all, strict) = verdict(json!({
+            "type": "object",
+            "properties": {
+                "u": {"anyOf": [{"$ref": "#/$defs/d0"}, {"type": "number"}], "multipleOf": 0}
+            },
+            "required": ["u"],
+            "$defs": defs
+        }));
+        assert!(!all);
+        assert_eq!(
+            strict, None,
+            "every leaf forces a numeric instance: \
+            the depth budget must not answer DoesNot and ship this strict"
+        );
+    }
+
+    #[test]
+    fn hop_cap_chain_beside_zero_multiple_fails_closed() {
+        // 17 `$ref` keys (r0..r15 + the branch's own) is the longest chain
+        // the reference walk admits; the deref budget used to strand the
+        // predicate on a still-`$ref` node after 16 hops and skip the
+        // judgment.
+        let mut defs_map = serde_json::Map::new();
+        for i in 0..16 {
+            defs_map.insert(
+                format!("r{i}"),
+                json!({"$ref": format!("#/$defs/r{}", i + 1)}),
+            );
+        }
+        defs_map.insert("r16".to_string(), json!({"type": "number"}));
+        let (all, strict) = verdict(json!({
+            "type": "object",
+            "properties": {
+                "u": {"anyOf": [{"$ref": "#/$defs/r0"}, {"type": "number"}], "multipleOf": 0}
+            },
+            "required": ["u"],
+            "$defs": defs_map
+        }));
+        assert!(!all);
+        assert_eq!(strict, None);
+    }
+
+    #[test]
+    fn hop_cap_satisfiable_chain_keeps_shipping() {
+        // Guard: a chain exactly at the walk's admission bound with no
+        // contradicting bounds resolves and ships — the inclusive deref
+        // budget must not fail satisfiable chains closed.
+        let mut defs_map = serde_json::Map::new();
+        for i in 0..16 {
+            defs_map.insert(
+                format!("r{i}"),
+                json!({"$ref": format!("#/$defs/r{}", i + 1)}),
+            );
+        }
+        defs_map.insert("r16".to_string(), json!({"type": "number"}));
+        let (all, strict) = verdict(json!({
+            "type": "object",
+            "properties": {
+                "u": {"$ref": "#/$defs/r0"}
+            },
+            "required": ["u"],
+            "$defs": defs_map
+        }));
+        assert!(all);
+        assert_eq!(strict, Some(true));
+    }
+
+    #[test]
+    fn pair_budget_exhaustion_on_an_or_tree_fails_closed() {
+        // A depth-11 binary OR-tree of `const: 1` leaves beside a
+        // `const: 2` pin explores 2^11 pair calls — past the shared
+        // preparation budget. Exhaustion used to abstain compatible and
+        // ship the union strict callable by nothing.
+        let mut tree = json!({"const": 1});
+        for _ in 0..11 {
+            tree = json!({"anyOf": [tree.clone(), tree.clone()]});
+        }
+        let (all, strict) = verdict(json!({
+            "type": "object",
+            "properties": {"u": {"anyOf": [tree, {"const": 1}], "const": 2}},
+            "required": ["u"]
+        }));
+        assert!(!all);
+        assert_eq!(
+            strict, None,
+            "budget exhaustion beside a judged \
+            constraint fails the tool closed instead of shipping strict"
+        );
+    }
+
+    #[test]
+    fn alternative_cap_overshoot_fails_closed() {
+        // 300 branches, every one pinning `const: 1`, beside a `const: 2`
+        // node: past the 256-alternative cap the chase used to abstain
+        // compatible and ship the union strict.
+        let branches: Vec<Value> = (0..300).map(|_| json!({"const": 1})).collect();
+        let (all, strict) = verdict(json!({
+            "type": "object",
+            "properties": {"u": {"anyOf": branches, "const": 2}},
+            "required": ["u"]
+        }));
+        assert!(!all);
+        assert_eq!(strict, None);
+    }
+
+    #[test]
+    fn enum_member_cap_beside_a_maximum_fails_closed() {
+        // 300 members (past the 256 cap) whose every member violates
+        // `maximum: 100`: the skipped scan used to abstain compatible.
+        let members: Vec<Value> = (200..500).map(|n| json!(n)).collect();
+        let (all, strict) = verdict(json!({
+            "type": "object",
+            "properties": {
+                "u": {"type": "integer", "enum": members, "maximum": 100}
+            },
+            "required": ["u"]
+        }));
+        assert!(!all);
+        assert_eq!(strict, None);
+    }
+
+    #[test]
+    fn enum_member_cap_bare_keeps_shipping() {
+        // Guard: a bare oversized enum with no judged constraint beside it
+        // is satisfiable by any member and keeps the abstention.
+        let members: Vec<Value> = (0..300).map(|n| json!(n)).collect();
+        let (all, strict) = verdict(json!({
+            "type": "object",
+            "properties": {"u": {"enum": members}},
+            "required": ["u"]
+        }));
+        assert!(all);
+        assert_eq!(strict, Some(true));
+    }
+
+    // --- D17: the pinned-object judgment recurses through nested
+    // --- property schemas instead of judging one level.
+
+    #[test]
+    fn three_level_pin_violating_a_leaf_type_fails_closed() {
+        let (all, strict) = verdict(json!({
+            "type": "object",
+            "properties": {
+                "u": {
+                    "properties": {
+                        "a": {
+                            "properties": {
+                                "b": {
+                                    "properties": {"c": {"type": "number"}},
+                                    "required": ["c"]
+                                }
+                            },
+                            "required": ["b"]
+                        }
+                    },
+                    "required": ["a"],
+                    "enum": [{"a": {"b": {"c": "x"}}}]
+                }
+            },
+            "required": ["u"]
+        }));
+        assert!(!all);
+        assert_eq!(
+            strict, None,
+            "the only enum member carries c: \"x\" \
+            against a c:number property — callable by nothing"
+        );
+    }
+
+    #[test]
+    fn three_level_satisfiable_pin_keeps_shipping() {
+        let (all, strict) = verdict(json!({
+            "type": "object",
+            "properties": {
+                "u": {
+                    "properties": {
+                        "a": {
+                            "properties": {
+                                "b": {
+                                    "properties": {"c": {"type": "string"}},
+                                    "required": ["c"]
+                                }
+                            },
+                            "required": ["b"]
+                        }
+                    },
+                    "required": ["a"],
+                    "enum": [{"a": {"b": {"c": "x"}}}]
+                }
+            },
+            "required": ["u"]
+        }));
+        assert!(all);
+        assert_eq!(strict, Some(true));
+    }
+
+    // --- M12: the root-composition note aggregates every keyword and
+    // --- discloses a single dropped group (the base behavior the round-22
+    // --- reconstruction dropped).
+
+    #[test]
+    fn root_note_discloses_every_stripped_keyword() {
+        // `sanitize_for_responses` flattens the root and builds the note;
+        // drive the note helper through the strict pipeline's sibling lane
+        // by asserting the direct helper output.
+        let node = serde_json::json!({
+            "oneOf": [
+                {"required": ["a", "b"]},
+                {"required": ["c", "d"]}
+            ],
+            "anyOf": [
+                {"required": ["e"]},
+                {"required": ["f"]}
+            ]
+        });
+        let note =
+            super::root_composition_constraint_note(node.as_object().expect("composition map"))
+                .expect("both composition keywords carry distinct labeled groups");
+        assert!(
+            note.contains("Exactly one of these parameter groups"),
+            "the oneOf contract is disclosed: {note}"
+        );
+        assert!(
+            note.contains("At least one of these parameter groups"),
+            "the anyOf contract is disclosed too — the first-match note \
+             advertised only the exactly-one contract (review 5898539144): \
+             {note}"
+        );
+    }
+
+    #[test]
+    fn root_note_discloses_a_single_dropped_group() {
+        let node = serde_json::json!({
+            "anyOf": [
+                {"required": ["a"], "minProperties": 1},
+                {"required": ["a"], "minProperties": 2}
+            ]
+        });
+        let note =
+            super::root_composition_constraint_note(node.as_object().expect("composition map"))
+                .expect("a single distinct group still relaxed the authored union");
+        assert!(
+            note.contains(
+                "At least one of these parameter groups must be \
+                provided: `a`."
+            ),
+            "suppressing the single-group note hides the loosening \
+             entirely: {note}"
+        );
+    }
+
+    // --- M7/M4: the pair budget is shared per preparation; the compile
+    // --- budget's pin asserts a literal bound (the constant-reading pin
+    // --- was tautological under `usize::MAX`).
+
+    #[test]
+    fn pair_budget_is_shared_across_a_preparation() {
+        // 200 satisfiable two-branch unions ≈ 400 pair calls from ONE
+        // preparation: the shared budget is consumed (a per-node
+        // fresh-budget regression leaves the cell untouched and this pin
+        // red). Every verdict stays satisfiable — no overclosure at this
+        // scale.
+        let mut properties = serde_json::Map::new();
+        for i in 0..200 {
+            properties.insert(
+                format!("u{i}"),
+                // The annotation sibling makes the node carry >1 key, the
+                // composition arm's envelope.
+                json!({
+                    "description": format!("union {i}"),
+                    "anyOf": [{"type": "string"}, {"type": "number"}]
+                }),
+            );
+        }
+        let schema = json!({"type": "object", "properties": properties, "required": ["u0"]});
+        let mut tools = vec![probe_tool("probe", schema)];
+        let all = prepare_tools_for_strict_mode(&mut tools);
+        assert!(all, "200 satisfiable unions stay fully judged: {:?}", all);
+        assert_eq!(tools[0].strict, Some(true));
+        assert!(
+            pair_budget_remaining_for_test() < STRICT_PAIR_JUDGE_CALL_BUDGET,
+            "the preparation consumed its shared budget"
+        );
+    }
+
+    #[test]
+    fn compile_budget_pin_reads_a_literal_bound() {
+        // 130 distinct judged patterns: the counter must stop at a LITERAL
+        // 128 — the old pin asserted `<= STRICT_PATTERN_COMPILE_BUDGET`,
+        // which read the very constant it claimed to bound and stayed
+        // green under `usize::MAX`.
+        let mut properties = serde_json::Map::new();
+        for i in 0..130 {
+            properties.insert(
+                format!("p{i}"),
+                json!({"type": "string", "pattern": format!("^qqq{i}$"), "enum": ["no-match"]}),
+            );
+        }
+        let schema = json!({"type": "object", "properties": properties, "required": ["p0"]});
+        let mut tools = vec![probe_tool("probe", schema)];
+        let _ = prepare_tools_for_strict_mode(&mut tools);
+        let (compiles, _leaked) = pattern_compile_counters_for_test();
+        assert!(
+            compiles <= 128,
+            "the compile budget stops at a literal 128, not at whatever \
+             the constant currently reads: {compiles}"
+        );
+    }
+
+    #[test]
+    fn compiled_program_size_cap_aborts_hostile_patterns() {
+        // The judge's real cost is member length × compiled-program size;
+        // the size cap makes the hostile nested-bounded repeat abort
+        // deterministically (the judge abstains, the pattern still binds
+        // on the wire) while a normal pattern compiles untouched.
+        let hostile = format!("{}z", "(a{1,100})".repeat(8));
+        assert!(
+            super::compile_documented_pattern(&hostile).is_none(),
+            "the nested-bounded repeat aborts at the compiled-program cap"
+        );
+        assert!(
+            super::compile_documented_pattern("^a[0-9]+z$").is_some(),
+            "a normal pattern compiles untouched"
+        );
+    }
+}
 #[cfg(test)]
 mod strict_fixwave_r21 {
     use super::*;
@@ -5525,6 +6640,16 @@ mod strict_fixwave_r21 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // Round 23: the base-side regression pins the round-22 `-X theirs`
+    // rebase silently dropped (80 tests: the xAI family incl. its
+    // fork-guard contract, the anthropic release-line harness, the
+    // required-context/instance-scope family, and the composition-note
+    // single-group pin). Re-grafted verbatim from the base tree; see the
+    // reconstruction audit in the round-23 review.
+    #[path = "schema_sanitize_restored_pins.rs"]
+    // resolved relative to src/tools/schema_sanitize/ for inline children
+    mod restored_base_pins;
 
     fn test_tool(name: &str, input_schema: Value) -> Tool {
         Tool {
@@ -10402,15 +11527,17 @@ mod tests {
     }
 
     #[test]
-    fn strict_mode_abstains_from_enum_pair_disjointness_past_the_member_cap() {
+    fn strict_mode_fails_closed_on_enum_pair_disjointness_past_the_member_cap() {
         // The enum-vs-enum membership scan is quadratic in the member
         // counts, and a hostile schema can park two huge disjoint enums on
         // a nested union's shared property to pay it per branch pair per
-        // request. Past the cap the membership judgment abstains
-        // (compatible-by-default, the same line the unjudgeable pattern
-        // spellings draw), so the branch covers and the union keeps strict
-        // mode — an explicit trade of a pathological contradiction
-        // judgment for bounded request cost; the small-enum disjointness
+        // request. Round-23 REVERSAL of the abstention pin: past the cap
+        // the judgment used to abstain compatible and the branch kept
+        // covering — but the caps burn out exactly when no member is
+        // shared, so the abstention landed on the unsatisfiable case.
+        // With a judged non-enum constraint present (the declared types
+        // here) the skipped scan could have proven the pair disjoint, and
+        // the honest verdict is fail-closed; the small-enum disjointness
         // pins above stay binding.
         let mut tool = test_tool(
             "probe",
@@ -10430,10 +11557,10 @@ mod tests {
             }),
         );
         assert!(
-            prepare_tools_for_strict_mode(std::slice::from_mut(&mut tool)),
-            "past the member cap the membership judgment abstains and the branch covers"
+            !prepare_tools_for_strict_mode(std::slice::from_mut(&mut tool)),
+            "past the member cap with a judged constraint present the tool              fails closed instead of shipping the disjoint pair strict"
         );
-        assert_eq!(tool.strict, Some(true));
+        assert_eq!(tool.strict, None);
     }
 
     #[test]
@@ -11058,15 +12185,15 @@ mod tests {
     }
 
     #[test]
-    fn strict_mode_abstains_from_the_member_judgment_past_the_pair_cap() {
+    fn strict_mode_fails_closed_on_the_member_judgment_past_the_pair_cap() {
         // The pair judge's per-member judgment is linear in the pinned
         // side's member count: a hostile 300-member enum past the cap
-        // abstains compatible-by-default instead of paying the scan per
-        // branch pair (the enum still ships and binds; the judge does not
-        // guess). The members all fail the covering branch's pattern, so
-        // a mutation that removes the cap runs the scan and turns this
-        // pin red — the witness is provably unsatisfiable and only the
-        // cap keeps it shipping.
+        // skips the scan. Round-23 REVERSAL of the abstention: the
+        // members all fail the covering branch's pattern — the witness is
+        // provably unsatisfiable and only the cap used to keep it
+        // shipping — so with the branch's judged `pattern` constraint
+        // present the honest verdict is fail-closed instead of
+        // compatible-by-default.
         let members: Vec<Value> = (0..300u32)
             .map(|i| Value::String(format!("m{i:04}")))
             .collect();
@@ -11087,19 +12214,23 @@ mod tests {
                 "required": ["spec"]
             }),
         );
-        assert!(prepare_tools_for_strict_mode(std::slice::from_mut(
+        assert!(!prepare_tools_for_strict_mode(std::slice::from_mut(
             &mut tool
         )));
-        assert_eq!(tool.strict, Some(true));
+        assert_eq!(tool.strict, None);
     }
 
     #[test]
     fn strict_mode_judges_enum_disjointness_at_the_exact_pair_cap() {
         // Cap boundary: 256-member disjoint enums are still chased (the
         // intersection scan runs at the boundary) and fail the union
-        // closed; 257 abstains. Pinning both edges keeps the constant's
-        // value from drifting silently in either direction.
-        for (count, should_ship) in [(256usize, false), (257, true)] {
+        // closed. Round-23 REVERSAL of the 257 half: past the cap the
+        // judgment used to abstain and keep shipping; with the declared
+        // types present the honest verdict is fail-closed, so both edges
+        // fail now — through the judged scan below the cap, through the
+        // exhaustion conversion above it. Pinning both edges keeps the
+        // constant's value from drifting silently in either direction.
+        for (count, should_ship) in [(256usize, false), (257, false)] {
             let members: Vec<Value> = (0..count as u32).map(Value::from).collect();
             let others: Vec<Value> = (1_000..1_000 + count as u32).map(Value::from).collect();
             let mut tool = test_tool(
@@ -11122,7 +12253,7 @@ mod tests {
             assert_eq!(
                 prepare_tools_for_strict_mode(std::slice::from_mut(&mut tool)),
                 should_ship,
-                "{count}-member disjoint enums: judged below the cap, abstained past it"
+                "{count}-member disjoint enums: judged below the cap,                  fail-closed past it"
             );
         }
     }
@@ -11359,17 +12490,20 @@ mod tests {
     }
 
     #[test]
-    fn pair_judge_abstains_compatible_once_the_call_budget_is_exhausted() {
-        // The budget is the work bound that turns a hostile cycle's
-        // exponential unwinding into an abstention: an exhausted budget
-        // (none left) abstains compatible on a pair that provably
-        // contradicts (disjoint types), while a fresh budget still reaches
-        // the contradiction. A budget removal (or a guard that stops
-        // honoring zero) is visible as the first assertion flipping.
+    fn pair_judge_fails_closed_once_the_call_budget_is_exhausted() {
+        // Round-23 REVERSAL of the abstention pin: the budget is the work
+        // bound that turns a hostile cycle's exponential unwinding into a
+        // bounded verdict, but the verdict at exhaustion used to be
+        // "compatible" — and the budgets burn out exactly when no branch
+        // or member survives, so the abstention landed precisely on the
+        // unsatisfiable case. Exhaustion now fails the pair closed where
+        // either side carries a judged constraint (disjoint types here —
+        // the probe verdict flips from the old `true` to `false`), and a
+        // fresh budget still reaches the contradiction the normal way.
         let string = json!({"type": "string"});
         let integer = json!({"type": "integer"});
         let mut exhausted = 0;
-        assert!(schema_pair_satisfiable(
+        assert!(!schema_pair_satisfiable(
             &string,
             &integer,
             &Value::Null,
@@ -11550,13 +12684,17 @@ mod tests {
     }
 
     #[test]
-    fn strict_mode_node_level_enum_scan_abstains_past_the_member_cap() {
+    fn strict_mode_node_level_enum_scan_fails_closed_past_the_member_cap() {
         // The node-level enum scan draws the same hostile-input line the
         // pair judge draws: within the 256-member cap a member set none of
-        // which satisfies the node fails the tool closed, past the cap the
-        // judgment abstains compatible instead of parking an unbounded
-        // per-member cost on the per-request path. Neutering the cap check
-        // flips the 257 half; shrinking the cap flips the 256 half.
+        // which satisfies the node fails the tool closed. Round-23
+        // REVERSAL of the past-cap half: the members all violate the
+        // node's `properties` judgment (`x` is a string, every member
+        // carries a number), so the skipped scan could have proven the
+        // node unsatisfiable — with that judged constraint present the
+        // honest verdict is fail-closed instead of the old abstention.
+        // Neutering the conversion flips the 257 half; shrinking the cap
+        // flips the 256 half.
         let make = |count: usize| {
             let members: Vec<Value> = (0..count).map(|_| json!({"x": 1})).collect();
             test_tool(
@@ -11574,12 +12712,12 @@ mod tests {
             !prepare_tools_for_strict_mode(std::slice::from_mut(&mut judged)),
             "a fully judged member set that admits nothing fails closed"
         );
-        let mut abstained = make(ENUM_PAIR_MEMBER_CAP + 1);
+        let mut converted = make(ENUM_PAIR_MEMBER_CAP + 1);
         assert!(
-            prepare_tools_for_strict_mode(std::slice::from_mut(&mut abstained)),
-            "past the member cap the scan abstains and the tool keeps strict"
+            !prepare_tools_for_strict_mode(std::slice::from_mut(&mut converted)),
+            "past the member cap with a judged constraint present the tool              fails closed instead of abstaining"
         );
-        assert_eq!(abstained.strict, Some(true));
+        assert_eq!(converted.strict, None);
     }
 
     #[test]
@@ -11762,13 +12900,17 @@ mod tests {
     }
 
     #[test]
-    fn pair_judge_abstains_past_the_enum_serialized_size_cap() {
+    fn pair_judge_fails_closed_past_the_enum_serialized_size_cap() {
         // The count cap alone made the membership scan's worst case a
         // function of member BYTES: two disjoint 256-member enums of
         // ~40-byte strings serialize to ~10 KB per side — judged, that is
-        // 65k full-value comparisons; past the size cap the judgment
-        // abstains compatible instead. Removing the byte cap flips this
-        // pin (the pair becomes provably disjoint and fails).
+        // 65k full-value comparisons. Round-23 REVERSAL: past the size cap
+        // the judgment used to abstain compatible; with the declared
+        // `type` constraints present the skipped scan could have proven
+        // the pair disjoint (these two member sets share nothing), so the
+        // honest verdict is fail-closed. Removing the byte cap still flips
+        // this pin — the pair then fails through the judged scan instead
+        // of the exhaustion conversion.
         let members_a: Vec<Value> = (0..256)
             .map(|i| Value::String(format!("member-with-a-long-name-{i:04}-padding-padding")))
             .collect();
@@ -11779,8 +12921,8 @@ mod tests {
         let b = json!({"type": "string", "enum": members_b});
         let mut budget = STRICT_PAIR_JUDGE_CALL_BUDGET;
         assert!(
-            schema_pair_satisfiable(&a, &b, &Value::Null, 0, &mut budget),
-            "an enum pair past the serialized-size cap must abstain compatible"
+            !schema_pair_satisfiable(&a, &b, &Value::Null, 0, &mut budget),
+            "an enum pair past the serialized-size cap with declared types              present fails closed"
         );
         // Small disjoint enums stay inside both caps and still fail.
         let small_a = json!({"type": "string", "enum": ["x"]});

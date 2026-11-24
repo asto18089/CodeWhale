@@ -1103,15 +1103,21 @@ async fn bounded_error_text_until(
 
 fn validate_base_url_security(base_url: &str) -> Result<()> {
     let display_base_url = redact_url_for_display(base_url);
-    if base_url.starts_with("https://")
-        || base_url.starts_with("http://localhost")
-        || base_url.starts_with("http://127.0.0.1")
-        || base_url.starts_with("http://[::1]")
+    // Scheme spellings compare case-insensitively (RFC 3986 §3.1: schemes
+    // are case-normalized): the route gate lowercases before it judges, so
+    // an uppercase-scheme URL was admitted by the gate and then refused
+    // here — a session that can never start while the doctor reported the
+    // route ready (round 23).
+    let scheme_normalized = base_url.to_ascii_lowercase();
+    if scheme_normalized.starts_with("https://")
+        || scheme_normalized.starts_with("http://localhost")
+        || scheme_normalized.starts_with("http://127.0.0.1")
+        || scheme_normalized.starts_with("http://[::1]")
     {
         return Ok(());
     }
 
-    if base_url.starts_with("http://")
+    if scheme_normalized.starts_with("http://")
         && std::env::var(ALLOW_INSECURE_HTTP_ENV)
             .or_else(|_| std::env::var(LEGACY_ALLOW_INSECURE_HTTP_ENV))
             .ok()
@@ -2411,7 +2417,17 @@ fn provider_default_wire_format(api_provider: ApiProvider) -> WireFormat {
 /// Legacy dialect kinds (`*Anthropic`) still force Messages. Custom providers
 /// honor `wire = "responses" | "anthropic" | "chat"` per-config (see
 /// `crates/config/src/provider.rs:Custom`). Everyone else keeps the descriptor's
-/// fixed policy (or Chat Completions).
+/// fixed policy (or Chat Completions). Round 23: the per-config `wire` key no
+/// longer reaches FAMILY (built-in, model-aware) tables — the route resolver
+/// builds a wire override for `ApiProvider::Custom` only
+/// (`route_runtime.rs::custom_wire_override`), so a `wire = "anthropic"` on
+/// `[providers.deepseek]` was honored HERE while every live dispatch path kept
+/// speaking chat: the doctor's round-22 wire-keyed verdict quoted a dialect no
+/// live client spoke (probed: the flag stripped on the chat wire while the
+/// doctor claimed the Messages wire forwarded it). Keying the function on what
+/// dispatch actually resolves keeps every consumer — client construction, the
+/// doctor verdicts, the capability report — on the dialect the session really
+/// speaks; the Custom half of the override is unchanged and honored.
 pub(crate) fn provider_wire_format_for_config(
     api_provider: ApiProvider,
     config: Option<&crate::config::Config>,
@@ -2424,7 +2440,7 @@ pub(crate) fn provider_wire_format_for_config(
             | ApiProvider::MinimaxAnthropic
             | ApiProvider::ModelstudioTokenPlanAnthropic
             | ApiProvider::ModelstudioCodingPlanAnthropic
-    ) || wire_dialect_prefers_anthropic(wire);
+    );
 
     if prefers_anthropic
         && matches!(

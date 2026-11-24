@@ -13960,3 +13960,23 @@ fn official_host_gate_rejects_an_interior_empty_path_segment() {
         "https://api.deepseek.com/v1/"
     ));
 }
+
+#[test]
+fn official_host_gate_rejects_the_path_percent_encode_printables() {
+    // Round 23: the six printable bytes WHATWG path canonicalization
+    // percent-encodes join the `%`/backslash rejections — the admitted
+    // string and the wire's request path disagreed (`/beta<x>` serializes
+    // as `/beta%3Cx%3E`), landing a 404 on the official host with the
+    // flag kept.
+    for byte in ["\"", "<", ">", "`", "{", "}"] {
+        let url = format!("https://api.deepseek.com/beta{byte}/v1");
+        assert!(
+            !url_is_official_deepseek_host(&url),
+            "the percent-encodeable byte {byte:?} must degrade to out of scope"
+        );
+    }
+    // Plain official paths stay admitted.
+    assert!(url_is_official_deepseek_host(
+        "https://api.deepseek.com/beta"
+    ));
+}

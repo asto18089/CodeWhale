@@ -1097,6 +1097,22 @@ pub fn url_is_official_deepseek_host(base_url: &str) -> bool {
         // percent-encoded rejections close. A single trailing slash stays
         // legal (the route identity folds it), so only INTERIOR empty
         // segments reject.
+        //
+        // The remaining printable bytes WHATWG path canonicalization
+        // percent-encodes — `"`, `<`, `>`, backtick, `{`, `}`
+        // (0x22/0x3C/0x3E/0x60/0x7B/0x7D) — join the same rejection: the
+        // admitted string and the wire's request path disagreed
+        // (`/beta<x>` serializes as `/beta%3Cx%3E`), landing a 404 on the
+        // official host with the flag kept. The comment above claims "a
+        // path the HTTP layer would canonicalize or percent-encode" is
+        // excluded; these six bytes are the last spellings where that was
+        // false (round 23).
+        if rest
+            .bytes()
+            .any(|byte| matches!(byte, b'"' | b'<' | b'>' | b'`' | b'{' | b'}'))
+        {
+            return false;
+        }
         if rest.contains("//") {
             return false;
         }
